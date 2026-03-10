@@ -4,6 +4,25 @@
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
+/*
+ * ======================= 引脚图（ESP32）=======================
+ * GPIO14  -> 卧室 PIR（人体红外）
+ * GPIO27  -> 厕所 PIR（人体红外）
+ * GPIO26  -> 厕所门磁（门关闭=HIGH，使用 INPUT_PULLUP）
+ * GPIO25  -> 床压传感器（有人=HIGH，使用 INPUT_PULLUP）
+ * GPIO33  -> 蜂鸣器（HIGH 响，LOW 停）
+ *
+ * 串口调试命令（115200）：
+ *   help                 查看全部命令
+ *   pins                 快速查看关键引脚数字/模拟值
+ *   d <pin>              读取指定引脚数字电平（digitalRead）
+ *   a <pin>              读取指定引脚模拟值（analogRead）
+ *   wifi                 查看当前 Wi-Fi/AP 状态
+ *   setwifi <s> <p>      临时设置 Wi-Fi 账号密码并重连
+ *   reconnect            立即重新发起 STA 连接
+ * ============================================================
+ */
+
 // Pin map
 constexpr uint8_t PIN_PIR_BEDROOM = 14;
 constexpr uint8_t PIN_PIR_TOILET = 27;
@@ -14,6 +33,8 @@ constexpr uint8_t PIN_BUZZER = 33;
 // Wi-Fi and MQTT
 const char* WIFI_SSID = "YOUR_WIFI_SSID";
 const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const char* AP_SSID = "SeniorAlert-Config";
+const char* AP_PASS = "12345678";
 
 const char* MQTT_BROKER_ADDR = "broker.example.com";
 constexpr uint16_t MQTT_BROKER_PORT = 1883;
@@ -98,6 +119,13 @@ struct RuntimeState {
 };
 
 RuntimeState g_state;
+String g_runtimeWifiSsid = WIFI_SSID;
+String g_runtimeWifiPass = WIFI_PASS;
+bool g_apConfigMode = false;
+uint32_t g_lastWifiBeginMs = 0;
+String g_serialLine;
+
+void ensureWifiConnected();
 
 const char* alertLevelToString(AlertLevel level) {
   switch (level) {
@@ -135,6 +163,155 @@ bool isSleepWindow(uint16_t minuteOfDay) {
 
 bool isDaytimeWindow(uint16_t minuteOfDay) {
   return minuteOfDay >= 8 * 60 && minuteOfDay <= 21 * 60;
+}
+
+void startApConfigMode() {
+  if (g_apConfigMode) {
+    return;
+  }
+  WiFi.mode(WIFI_AP_STA);
+  const bool ok = WiFi.softAP(AP_SSID, AP_PASS);
+  g_apConfigMode = ok;
+  if (ok) {
+    Serial.printf("[INFO] AP 配网已开启：SSID=%s, PASS=%s, AP_IP=%s\n",
+                  AP_SSID,
+                  AP_PASS,
+                  WiFi.softAPIP().toString().c_str());
+  } else {
+    Serial.println("[WARN] AP 配网开启失败。请检查 ESP32 Wi-Fi 模块状态。");
+  }
+}
+
+void stopApConfigMode() {
+  if (!g_apConfigMode) {
+    return;
+  }
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_STA);
+  g_apConfigMode = false;
+  Serial.println("[INFO] AP 配网已关闭，切换回纯 STA 模式。");
+}
+
+
+
+void printWifiStatus() {
+  const wl_status_t st = WiFi.status();
+  Serial.printf("[INFO] Wi-Fi status=%d, STA_IP=%s, AP_mode=%s, AP_IP=%s\n",
+                static_cast<int>(st),
+                WiFi.localIP().toString().c_str(),
+                g_apConfigMode ? "ON" : "OFF",
+                WiFi.softAPIP().toString().c_str());
+  if (st != WL_CONNECTED) {
+    Serial.println("[INFO] 当前未联网，可连接 AP 热点进行配网。");
+  }
+}
+
+void printPinSnapshot() {
+  Serial.println("[DEBUG] 关键引脚快照：");
+  Serial.printf("  GPIO14 PIR_BEDROOM digital=%d analog=%d\n", digitalRead(PIN_PIR_BEDROOM), analogRead(PIN_PIR_BEDROOM));
+  Serial.printf("  GPIO27 PIR_TOILET  digital=%d analog=%d\n", digitalRead(PIN_PIR_TOILET), analogRead(PIN_PIR_TOILET));
+  Serial.printf("  GPIO26 DOOR_TOILET digital=%d analog=%d\n", digitalRead(PIN_DOOR_TOILET), analogRead(PIN_DOOR_TOILET));
+  Serial.printf("  GPIO25 BED_SENSOR  digital=%d analog=%d\n", digitalRead(PIN_BED_PRESSURE), analogRead(PIN_BED_PRESSURE));
+  Serial.printf("  GPIO33 BUZZER      digital=%d analog=%d\n", digitalRead(PIN_BUZZER), analogRead(PIN_BUZZER));
+}
+
+void printSerialHelp() {
+  Serial.println("[DEBUG] 可用命令：");
+  Serial.println("  help                 - 查看命令说明");
+  Serial.println("  pins                 - 快速查看关键引脚电平/模拟值");
+  Serial.println("  d <pin>              - 读取指定引脚数字电平");
+  Serial.println("  a <pin>              - 读取指定引脚模拟值");
+  Serial.println("  wifi                 - 查看 Wi-Fi/AP 状态");
+  Serial.println("  setwifi <ssid> <pwd> - 临时设置 Wi-Fi 并重连");
+  Serial.println("  reconnect            - 立即触发 Wi-Fi 重连");
+}
+
+void processSerialCommand(const String& rawLine) {
+  String line = rawLine;
+  line.trim();
+  if (line.length() == 0) {
+    return;
+  }
+
+  if (line == "help") {
+    printSerialHelp();
+    return;
+  }
+  if (line == "pins") {
+    printPinSnapshot();
+    return;
+  }
+  if (line == "wifi") {
+    printWifiStatus();
+    return;
+  }
+  if (line == "reconnect") {
+    WiFi.disconnect(true, false);
+    g_lastWifiBeginMs = 0;
+    ensureWifiConnected();
+    return;
+  }
+
+  if (line.startsWith("d ")) {
+    const int pin = line.substring(2).toInt();
+    pinMode(pin, INPUT);
+    Serial.printf("[DEBUG] digitalRead(GPIO%d)=%d\n", pin, digitalRead(pin));
+    return;
+  }
+
+  if (line.startsWith("a ")) {
+    const int pin = line.substring(2).toInt();
+    pinMode(pin, INPUT);
+    Serial.printf("[DEBUG] analogRead(GPIO%d)=%d\n", pin, analogRead(pin));
+    return;
+  }
+
+  if (line.startsWith("setwifi ")) {
+    const int firstSpace = line.indexOf(' ');
+    const int secondSpace = line.indexOf(' ', firstSpace + 1);
+    if (secondSpace < 0) {
+      Serial.println("[WARN] 用法错误：setwifi <ssid> <pwd>");
+      return;
+    }
+
+    g_runtimeWifiSsid = line.substring(firstSpace + 1, secondSpace);
+    g_runtimeWifiPass = line.substring(secondSpace + 1);
+    g_runtimeWifiSsid.trim();
+    g_runtimeWifiPass.trim();
+
+    if (g_runtimeWifiSsid.length() == 0) {
+      Serial.println("[WARN] SSID 不能为空。");
+      return;
+    }
+
+    Serial.printf("[INFO] 已更新 Wi-Fi 参数，准备重连：SSID=%s\n", g_runtimeWifiSsid.c_str());
+    WiFi.disconnect(true, false);
+    g_lastWifiBeginMs = 0;
+    ensureWifiConnected();
+    return;
+  }
+
+  Serial.printf("[WARN] 未知命令：%s，输入 help 查看支持命令。\n", line.c_str());
+}
+
+// 串口命令解析器：按行读取并执行调试命令。
+void handleSerialCommands() {
+  while (Serial.available() > 0) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\r') {
+      continue;
+    }
+    if (c == '\n') {
+      processSerialCommand(g_serialLine);
+      g_serialLine = "";
+    } else {
+      g_serialLine += c;
+      if (g_serialLine.length() > 160) {
+        g_serialLine = "";
+        Serial.println("[WARN] 命令过长，已清空输入缓冲。");
+      }
+    }
+  }
 }
 
 void beep(uint16_t durationMs, uint8_t repeat = 1) {
@@ -223,15 +400,22 @@ uint16_t averageWakeupMinute() {
 
 void ensureWifiConnected() {
   if (WiFi.status() == WL_CONNECTED) {
+    stopApConfigMode();
     return;
   }
 
+  // 若距离上次发起连接不足 5 秒，则不重复 begin，避免阻塞主循环。
+  if (millis() - g_lastWifiBeginMs < 5000) {
+    return;
+  }
+  g_lastWifiBeginMs = millis();
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("[INFO] Connecting Wi-Fi: %s\n", WIFI_SSID);
+  WiFi.begin(g_runtimeWifiSsid.c_str(), g_runtimeWifiPass.c_str());
+  Serial.printf("[INFO] Connecting Wi-Fi: %s\n", g_runtimeWifiSsid.c_str());
 
   uint8_t retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 20) {
+  while (WiFi.status() != WL_CONNECTED && retry < 10) {
     delay(500);
     Serial.print(".");
     retry++;
@@ -240,8 +424,10 @@ void ensureWifiConnected() {
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("[INFO] Wi-Fi connected, IP=%s\n", WiFi.localIP().toString().c_str());
+    stopApConfigMode();
   } else {
-    Serial.println("[WARN] Wi-Fi not connected, continue offline.");
+    Serial.println("[WARN] Wi-Fi not connected, continue offline and enable AP config mode.");
+    startApConfigMode();
   }
 }
 
@@ -473,7 +659,44 @@ void handleApiStatus() {
   doc["bed_warn"] = g_state.bedWarnSent;
   doc["no_activity_warn"] = g_state.noActivityWarnSent;
   doc["activity_drop_warn"] = g_state.activityDropWarnSent;
+  doc["wifi_connected"] = WiFi.status() == WL_CONNECTED;
+  doc["wifi_ssid"] = WiFi.status() == WL_CONNECTED ? WiFi.SSID() : g_runtimeWifiSsid;
+  doc["wifi_ip"] = WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : "0.0.0.0";
+  doc["ap_mode"] = g_apConfigMode;
+  doc["ap_ssid"] = AP_SSID;
+  doc["ap_ip"] = WiFi.softAPIP().toString();
 
+  String payload;
+  serializeJson(doc, payload);
+  g_web.send(200, "application/json; charset=utf-8", payload);
+}
+
+// 处理网页 AP 配网请求：用户提交 SSID/密码后立即尝试重连。
+void handleApiWifiConfig() {
+  if (!g_web.hasArg("ssid") || !g_web.hasArg("pass")) {
+    g_web.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"msg\":\"missing ssid or pass\"}");
+    return;
+  }
+
+  g_runtimeWifiSsid = g_web.arg("ssid");
+  g_runtimeWifiPass = g_web.arg("pass");
+  g_runtimeWifiSsid.trim();
+  g_runtimeWifiPass.trim();
+
+  if (g_runtimeWifiSsid.length() == 0) {
+    g_web.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"msg\":\"ssid empty\"}");
+    return;
+  }
+
+  WiFi.disconnect(true, false);
+  g_lastWifiBeginMs = 0;
+  ensureWifiConnected();
+
+  JsonDocument doc;
+  doc["ok"] = true;
+  doc["msg"] = "wifi config received";
+  doc["ssid"] = g_runtimeWifiSsid;
+  doc["ap_mode"] = g_apConfigMode;
   String payload;
   serializeJson(doc, payload);
   g_web.send(200, "application/json; charset=utf-8", payload);
@@ -481,7 +704,7 @@ void handleApiStatus() {
 
 String htmlPage() {
   String page;
-  page.reserve(2800);
+  page.reserve(4300);
   page += "<!doctype html><html><head><meta charset='utf-8'>";
   page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   page += "<title>Privacy Alert Dashboard</title>";
@@ -503,6 +726,15 @@ String htmlPage() {
   page += "<div><span class='k'>起床异常</span><div class='v' id='wakeup'>-</div></div>";
   page += "<div><span class='k'>活动量骤降</span><div class='v' id='drop'>-</div></div>";
   page += "</div>";
+  page += "<div class='card'>";
+  page += "<div><span class='k'>联网状态</span><div class='v' id='net'>-</div></div>";
+  page += "<div><span class='k'>设备 IP</span><div class='v' id='ip'>-</div></div>";
+  page += "<div id='apTip' style='display:none;margin-top:10px;color:#a66b00;'>设备当前未联网，已开启 AP 配网：<b id='apSsid'></b>（IP: <span id='apIp'></span>）</div>";
+  page += "<div id='cfgForm' style='display:none;margin-top:10px;'>";
+  page += "<input id='ssid' placeholder='Wi-Fi SSID' style='padding:8px;margin-right:6px;'>";
+  page += "<input id='pass' type='password' placeholder='Wi-Fi 密码' style='padding:8px;margin-right:6px;'>";
+  page += "<button onclick='saveWifi()' style='padding:8px 12px;'>提交配网</button>";
+  page += "</div></div>";
   page += "<script>";
   page += "async function pull(){";
   page += "const r=await fetch('/api/status');const d=await r.json();";
@@ -515,7 +747,20 @@ String htmlPage() {
   page += "document.getElementById('toilet').textContent=(d.toilet_door_closed&&d.toilet_pir)?'疑似滞留':'正常';";
   page += "document.getElementById('wakeup').textContent=d.wakeup_warn?'异常':'正常';";
   page += "document.getElementById('drop').textContent=d.activity_drop_warn?'异常':'正常';";
-  page += "} pull(); setInterval(pull,3000);";
+  page += "document.getElementById('net').textContent=d.wifi_connected?('已联网：'+d.wifi_ssid):'未联网（AP配网中）';";
+  page += "document.getElementById('ip').textContent=d.wifi_ip;";
+  page += "const showCfg=!d.wifi_connected;";
+  page += "document.getElementById('cfgForm').style.display=showCfg?'block':'none';";
+  page += "document.getElementById('apTip').style.display=showCfg?'block':'none';";
+  page += "document.getElementById('apSsid').textContent=d.ap_ssid;";
+  page += "document.getElementById('apIp').textContent=d.ap_ip;";
+  page += "}";
+  page += "async function saveWifi(){const ssid=document.getElementById('ssid').value;const pass=document.getElementById('pass').value;";
+  page += "if(!ssid){alert('SSID 不能为空');return;}";
+  page += "const b='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass);";
+  page += "const r=await fetch('/api/wifi-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});";
+  page += "const d=await r.json();alert(d.ok?'已提交配网，设备正在重连':'提交失败：'+(d.msg||'unknown'));}";
+  page += "pull(); setInterval(pull,3000);";
   page += "</script></body></html>";
   return page;
 }
@@ -527,12 +772,14 @@ void handleRoot() {
 void setupWebServer() {
   g_web.on("/", HTTP_GET, handleRoot);
   g_web.on("/api/status", HTTP_GET, handleApiStatus);
+  g_web.on("/api/wifi-config", HTTP_POST, handleApiWifiConfig);
   g_web.begin();
   Serial.println("[INFO] Web dashboard started: http://<esp32-ip>/");
 }
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("[INFO] 串口已启动，输入 help 查看调试命令。");
 
   pinMode(PIN_PIR_BEDROOM, INPUT);
   pinMode(PIN_PIR_TOILET, INPUT);
@@ -561,6 +808,7 @@ void loop() {
   ensureMqttConnected(nowMs);
   g_mqtt.loop();
   g_web.handleClient();
+  handleSerialCommands();
 
   scanSensors(nowMs);
   evaluateRules(nowMs);
