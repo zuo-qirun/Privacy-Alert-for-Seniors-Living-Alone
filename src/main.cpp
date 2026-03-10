@@ -124,9 +124,7 @@ String g_runtimeWifiPass = WIFI_PASS;
 bool g_apConfigMode = false;
 uint32_t g_lastWifiBeginMs = 0;
 String g_serialLine;
-bool g_wifiStackReady = false;
 
-void ensureWifiStackReady();
 void ensureWifiConnected();
 
 const char* alertLevelToString(AlertLevel level) {
@@ -168,8 +166,6 @@ bool isDaytimeWindow(uint16_t minuteOfDay) {
 }
 
 void startApConfigMode() {
-  ensureWifiStackReady();
-
   if (g_apConfigMode) {
     return;
   }
@@ -191,7 +187,6 @@ void stopApConfigMode() {
     return;
   }
   WiFi.softAPdisconnect(true);
-  ensureWifiStackReady();
   WiFi.mode(WIFI_STA);
   g_apConfigMode = false;
   Serial.println("[INFO] AP 配网已关闭，切换回纯 STA 模式。");
@@ -429,6 +424,7 @@ void ensureWifiConnected() {
   }
   g_lastWifiBeginMs = millis();
 
+  WiFi.mode(WIFI_STA);
   WiFi.begin(g_runtimeWifiSsid.c_str(), g_runtimeWifiPass.c_str());
   Serial.printf("[INFO] Connecting Wi-Fi: %s\n", g_runtimeWifiSsid.c_str());
 
