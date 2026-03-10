@@ -28,8 +28,10 @@
 
 7. 展示与远程输出  
 - 串口状态看板（每 5 秒输出）  
+- 串口调试命令（可读指定引脚数字电平 / 模拟值）  
 - Web 页面实时状态看板（`/`）  
 - JSON 接口（`/api/status`）  
+- AP 配网页面与接口（离线时自动显示）
 - MQTT 告警上报
 
 ## 默认硬件引脚
@@ -46,6 +48,8 @@
 
 - `WIFI_SSID`
 - `WIFI_PASS`
+- `AP_SSID`
+- `AP_PASS`
 - `MQTT_BROKER_ADDR`
 - `MQTT_BROKER_PORT`
 - `MQTT_CLIENT_ID`
@@ -65,6 +69,25 @@ platformio device monitor
 
 - `http://<esp32-ip>/`
 - `http://<esp32-ip>/api/status`
+
+当设备无法连上路由器时，会自动开启 AP 配网模式：
+
+- AP SSID 默认：`SeniorAlert-Config`
+- AP 密码默认：`12345678`
+
+手机连接 AP 后访问设备页面，可直接提交家庭 Wi-Fi 账号密码，设备会立即重连。
+
+## 串口调试命令
+
+串口波特率：`115200`
+
+- `help`：查看命令说明
+- `pins`：查看关键引脚数字值 + 模拟值
+- `d <pin>`：读取指定 GPIO 数字电平
+- `a <pin>`：读取指定 GPIO 模拟输入
+- `wifi`：查看当前 Wi-Fi / AP 状态
+- `setwifi <ssid> <pwd>`：临时更新 Wi-Fi 并重连
+- `reconnect`：立即触发重连
 
 ## 注意
 
