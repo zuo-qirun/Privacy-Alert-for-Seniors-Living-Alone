@@ -1,103 +1,140 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 
-/**
- * 隐私安全独居老人告警系统（ESP32 + PlatformIO）
- *
- * 传感器引脚定义（请按接线修改）：
- * - 卧室 PIR 红外       -> GPIO 14（数字输入）
- * - 厕所 PIR 红外       -> GPIO 27（数字输入）
- * - 厕所门磁传感器       -> GPIO 26（数字输入，默认 HIGH=关门，LOW=开门）
- * - 床边压力垫/压感开关   -> GPIO 25（数字输入，默认 HIGH=有人在床上）
- * - 蜂鸣器               -> GPIO 33（数字输出）
- */
+// Pin map
+constexpr uint8_t PIN_PIR_BEDROOM = 14;
+constexpr uint8_t PIN_PIR_TOILET = 27;
+constexpr uint8_t PIN_DOOR_TOILET = 26;
+constexpr uint8_t PIN_BED_PRESSURE = 25;
+constexpr uint8_t PIN_BUZZER = 33;
 
-// ===================== 引脚区（Pin Map） =====================
-constexpr uint8_t PIN_PIR_BEDROOM = 14;   // 卧室 PIR
-constexpr uint8_t PIN_PIR_TOILET = 27;    // 厕所 PIR
-constexpr uint8_t PIN_DOOR_TOILET = 26;   // 厕所门磁
-constexpr uint8_t PIN_BED_PRESSURE = 25;  // 床边压力垫
-constexpr uint8_t PIN_BUZZER = 33;        // 蜂鸣器
+// Wi-Fi and MQTT
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
 
-// ===================== Wi-Fi / MQTT 告警配置 =====================
-const char *WIFI_SSID = "YOUR_WIFI_SSID";
-const char *WIFI_PASS = "YOUR_WIFI_PASSWORD";
-
-// MQTT 地址与私钥（按要求设置为常量）
-const char *MQTT_BROKER_ADDR = "broker.example.com";
+const char* MQTT_BROKER_ADDR = "broker.example.com";
 constexpr uint16_t MQTT_BROKER_PORT = 1883;
-const char *MQTT_CLIENT_ID = "senior-alert-esp32";
-const char *MQTT_USERNAME = "senior_alert";
-const char *MQTT_PRIVATE_KEY = "YOUR_MQTT_PRIVATE_KEY";  // 私钥/密码常量
-const char *MQTT_ALERT_TOPIC = "senior/alert/events";
+const char* MQTT_CLIENT_ID = "senior-alert-esp32";
+const char* MQTT_USERNAME = "senior_alert";
+const char* MQTT_PRIVATE_KEY = "YOUR_MQTT_PRIVATE_KEY";
+const char* MQTT_ALERT_TOPIC = "senior/alert/events";
 
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
+// Rule thresholds
+constexpr uint32_t MINUTE_MS = 60UL * 1000UL;
+constexpr uint32_t HOUR_MS = 60UL * MINUTE_MS;
+constexpr uint32_t DAY_MS = 24UL * HOUR_MS;
 
-// ===================== 时间阈值（毫秒） =====================
-constexpr uint32_t MINUTE = 60UL * 1000UL;
-constexpr uint32_t HOUR = 60UL * MINUTE;
-constexpr uint32_t TOILET_WARN_MS = 12UL * MINUTE;      // 厕所滞留一级提醒
-constexpr uint32_t TOILET_CRITICAL_MS = 18UL * MINUTE;  // 厕所滞留二级远程告警
-constexpr uint32_t BED_WARN_MS = 3UL * HOUR;            // 白天连续卧床预警
-constexpr uint32_t NO_ACTIVITY_WARN_MS = 2UL * HOUR;    // 长时间无活动提醒
+constexpr uint32_t TOILET_WARN_MS = 12UL * MINUTE_MS;
+constexpr uint32_t TOILET_CRITICAL_MS = 18UL * MINUTE_MS;
+constexpr uint32_t BED_WARN_MS = 3UL * HOUR_MS;
+constexpr uint32_t NO_ACTIVITY_WARN_MS = 2UL * HOUR_MS;
 
-// 起床基准时间（示例：7:00，允许晚 90 分钟）
-constexpr uint16_t AVG_WAKEUP_MINUTE = 7 * 60;
-constexpr uint16_t WAKEUP_DELAY_TOLERANCE = 90;
+constexpr uint16_t DEFAULT_WAKEUP_MINUTE = 7 * 60;  // 07:00
+constexpr uint16_t WAKEUP_TOLERANCE_MINUTES = 90;
 
-enum class RiskLevel : uint8_t {
-  NORMAL,
-  LIGHT,
-  MEDIUM,
-  HI
+constexpr uint8_t HISTORY_DAYS = 5;
+constexpr uint16_t INVALID_WAKEUP_MINUTE = 0xFFFF;
+
+WiFiClient g_wifiClient;
+PubSubClient g_mqtt(g_wifiClient);
+WebServer g_web(80);
+
+enum class AlertLevel : uint8_t {
+  INFO = 0,
+  WARNING = 1,
+  CRITICAL = 2
 };
 
-struct RuntimeStats {
-  bool bedroomPirTriggeredToday = false;
-  bool toiletPirState = false;
+struct DayRecord {
+  uint16_t totalTriggers = 0;
+  uint16_t wakeupMinute = INVALID_WAKEUP_MINUTE;
+};
+
+struct RuntimeState {
+  // Current sensor state
+  bool bedroomPir = false;
+  bool toiletPir = false;
   bool toiletDoorClosed = false;
   bool bedOccupied = false;
 
-  uint32_t bedroomPirTriggersToday = 0;
-  uint32_t toiletDoorTriggersToday = 0;
-  uint32_t totalTriggersToday = 0;
+  // Edge detection cache
+  bool lastBedroomPir = false;
+  bool lastToiletPir = false;
+  bool lastToiletDoorClosed = false;
+  bool lastBedOccupied = false;
 
+  // Time markers
   uint32_t lastActivityMs = 0;
-  uint32_t toiletEnterMs = 0;
   uint32_t bedOccupiedStartMs = 0;
+  uint32_t toiletEnterMs = 0;
+  uint32_t lastDashboardMs = 0;
+  uint32_t lastMqttRetryMs = 0;
 
+  // Daily counters
+  uint32_t uptimeDay = 0;
+  uint16_t bedroomPirTriggersToday = 0;
+  uint16_t toiletDoorChangesToday = 0;
+  uint16_t totalTriggersToday = 0;
+  uint16_t wakeupMinuteToday = INVALID_WAKEUP_MINUTE;
+
+  // Rule one-shot guards per day
+  bool wakeupWarnSent = false;
   bool toiletWarnSent = false;
   bool toiletCriticalSent = false;
   bool bedWarnSent = false;
   bool noActivityWarnSent = false;
-  bool wakeupWarnSent = false;
+  bool activityDropWarnSent = false;
 
-  RiskLevel currentRisk = RiskLevel::NORMAL;
+  // Highest alert reached today
+  AlertLevel riskToday = AlertLevel::INFO;
+
+  // Rolling history
+  DayRecord history[HISTORY_DAYS];
+  uint8_t historyWriteIndex = 0;
+  uint8_t historyCount = 0;
 };
 
-RuntimeStats stats;
+RuntimeState g_state;
 
-// 活动量基线（示例值，可改为 EEPROM/NVS 持久化）
-uint16_t avgTriggersHistory5Days = 120;
-
-bool lastBedroomPir = false;
-bool lastToiletPir = false;
-bool lastToiletDoorClosed = false;
-bool lastBedOccupied = false;
-
-uint32_t lastReportMs = 0;
-
-static const char *riskToString(RiskLevel risk) {
-  switch (risk) {
-    case RiskLevel::NORMAL: return "正常";
-    case RiskLevel::LIGHT: return "轻度异常";
-    case RiskLevel::MEDIUM: return "中度异常";
-    case RiskLevel::HI: return "高风险";
+const char* alertLevelToString(AlertLevel level) {
+  switch (level) {
+    case AlertLevel::INFO:
+      return "normal";
+    case AlertLevel::WARNING:
+      return "warning";
+    case AlertLevel::CRITICAL:
+      return "critical";
+    default:
+      return "unknown";
   }
-  return "未知";
+}
+
+const char* alertLevelToChinese(AlertLevel level) {
+  switch (level) {
+    case AlertLevel::INFO:
+      return "正常";
+    case AlertLevel::WARNING:
+      return "中度异常";
+    case AlertLevel::CRITICAL:
+      return "高风险";
+    default:
+      return "未知";
+  }
+}
+
+uint16_t minuteOfDayFromUptime(uint32_t nowMs) {
+  return static_cast<uint16_t>((nowMs / MINUTE_MS) % (24UL * 60UL));
+}
+
+bool isSleepWindow(uint16_t minuteOfDay) {
+  return (minuteOfDay >= 23 * 60) || (minuteOfDay <= 6 * 60);
+}
+
+bool isDaytimeWindow(uint16_t minuteOfDay) {
+  return minuteOfDay >= 8 * 60 && minuteOfDay <= 21 * 60;
 }
 
 void beep(uint16_t durationMs, uint8_t repeat = 1) {
@@ -109,16 +146,89 @@ void beep(uint16_t durationMs, uint8_t repeat = 1) {
   }
 }
 
-void updateRisk(RiskLevel level) {
-  if (static_cast<uint8_t>(level) > static_cast<uint8_t>(stats.currentRisk)) {
-    stats.currentRisk = level;
+void escalateRisk(AlertLevel level) {
+  if (static_cast<uint8_t>(level) > static_cast<uint8_t>(g_state.riskToday)) {
+    g_state.riskToday = level;
   }
 }
 
-void connectWiFi() {
+void resetDailyFlagsAndCounters() {
+  g_state.bedroomPirTriggersToday = 0;
+  g_state.toiletDoorChangesToday = 0;
+  g_state.totalTriggersToday = 0;
+  g_state.wakeupMinuteToday = INVALID_WAKEUP_MINUTE;
+
+  g_state.wakeupWarnSent = false;
+  g_state.toiletWarnSent = false;
+  g_state.toiletCriticalSent = false;
+  g_state.bedWarnSent = false;
+  g_state.noActivityWarnSent = false;
+  g_state.activityDropWarnSent = false;
+
+  g_state.riskToday = AlertLevel::INFO;
+}
+
+void pushDayRecord(const DayRecord& record) {
+  g_state.history[g_state.historyWriteIndex] = record;
+  g_state.historyWriteIndex = (g_state.historyWriteIndex + 1) % HISTORY_DAYS;
+  if (g_state.historyCount < HISTORY_DAYS) {
+    g_state.historyCount++;
+  }
+}
+
+void rolloverDayIfNeeded(uint32_t nowMs) {
+  uint32_t currentDay = nowMs / DAY_MS;
+  if (currentDay == g_state.uptimeDay) {
+    return;
+  }
+
+  DayRecord done{};
+  done.totalTriggers = g_state.totalTriggersToday;
+  done.wakeupMinute = g_state.wakeupMinuteToday;
+  pushDayRecord(done);
+
+  g_state.uptimeDay = currentDay;
+  resetDailyFlagsAndCounters();
+  g_state.lastActivityMs = nowMs;
+
+  Serial.println("[INFO] New day started, daily counters reset.");
+}
+
+uint16_t averageTriggerCount() {
+  if (g_state.historyCount == 0) {
+    return 120;  // bootstrap baseline
+  }
+
+  uint32_t sum = 0;
+  for (uint8_t i = 0; i < g_state.historyCount; ++i) {
+    sum += g_state.history[i].totalTriggers;
+  }
+  return static_cast<uint16_t>(sum / g_state.historyCount);
+}
+
+uint16_t averageWakeupMinute() {
+  uint32_t sum = 0;
+  uint8_t count = 0;
+  for (uint8_t i = 0; i < g_state.historyCount; ++i) {
+    if (g_state.history[i].wakeupMinute != INVALID_WAKEUP_MINUTE) {
+      sum += g_state.history[i].wakeupMinute;
+      count++;
+    }
+  }
+  if (count == 0) {
+    return DEFAULT_WAKEUP_MINUTE;
+  }
+  return static_cast<uint16_t>(sum / count);
+}
+
+void ensureWifiConnected() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("[INFO] 正在连接 Wi-Fi: %s\n", WIFI_SSID);
+  Serial.printf("[INFO] Connecting Wi-Fi: %s\n", WIFI_SSID);
 
   uint8_t retry = 0;
   while (WiFi.status() != WL_CONNECTED && retry < 20) {
@@ -129,193 +239,296 @@ void connectWiFi() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("[INFO] Wi-Fi 已连接，IP=%s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("[INFO] Wi-Fi connected, IP=%s\n", WiFi.localIP().toString().c_str());
   } else {
-    Serial.println("[WARN] Wi-Fi 连接失败，系统继续离线运行");
+    Serial.println("[WARN] Wi-Fi not connected, continue offline.");
   }
 }
 
-void connectMqtt() {
-  mqttClient.setServer(MQTT_BROKER_ADDR, MQTT_BROKER_PORT);
-
-  if (WiFi.status() != WL_CONNECTED) {
+void ensureMqttConnected(uint32_t nowMs) {
+  if (WiFi.status() != WL_CONNECTED || g_mqtt.connected()) {
     return;
   }
 
-  if (mqttClient.connected()) {
+  if (nowMs - g_state.lastMqttRetryMs < 5000) {
     return;
   }
+  g_state.lastMqttRetryMs = nowMs;
 
-  Serial.printf("[INFO] 正在连接 MQTT: %s:%u\n", MQTT_BROKER_ADDR, MQTT_BROKER_PORT);
-  if (mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PRIVATE_KEY)) {
-    Serial.println("[INFO] MQTT 连接成功");
+  g_mqtt.setServer(MQTT_BROKER_ADDR, MQTT_BROKER_PORT);
+  Serial.printf("[INFO] Connecting MQTT: %s:%u\n", MQTT_BROKER_ADDR, MQTT_BROKER_PORT);
+  if (g_mqtt.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PRIVATE_KEY)) {
+    Serial.println("[INFO] MQTT connected.");
   } else {
-    Serial.printf("[WARN] MQTT 连接失败, state=%d\n", mqttClient.state());
+    Serial.printf("[WARN] MQTT connect failed, state=%d\n", g_mqtt.state());
   }
 }
 
-void sendRemoteAlert(const char *title, const char *detail, RiskLevel level) {
+void publishAlert(const char* title, const char* detail, AlertLevel level) {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WARN] Wi-Fi 未连接，跳过 MQTT 告警发送");
+    Serial.println("[WARN] Skip MQTT alert: Wi-Fi disconnected.");
     return;
   }
 
-  if (!mqttClient.connected()) {
-    connectMqtt();
-  }
-
-  if (!mqttClient.connected()) {
-    Serial.println("[WARN] MQTT 未连接，告警发送失败");
+  ensureMqttConnected(millis());
+  if (!g_mqtt.connected()) {
+    Serial.println("[WARN] Skip MQTT alert: MQTT disconnected.");
     return;
   }
 
   JsonDocument doc;
   doc["title"] = title;
   doc["detail"] = detail;
-  doc["risk"] = riskToString(level);
+  doc["risk"] = alertLevelToString(level);
+  doc["risk_cn"] = alertLevelToChinese(level);
   doc["uptime_ms"] = millis();
-  doc["bed_occupied"] = stats.bedOccupied;
-  doc["toilet_door_closed"] = stats.toiletDoorClosed;
-  doc["toilet_pir"] = stats.toiletPirState;
-  doc["today_total_triggers"] = stats.totalTriggersToday;
+  doc["minute_of_day"] = minuteOfDayFromUptime(millis());
+  doc["bed_occupied"] = g_state.bedOccupied;
+  doc["toilet_door_closed"] = g_state.toiletDoorClosed;
+  doc["toilet_pir"] = g_state.toiletPir;
+  doc["today_total_triggers"] = g_state.totalTriggersToday;
 
   String payload;
   serializeJson(doc, payload);
-
-  bool ok = mqttClient.publish(MQTT_ALERT_TOPIC, payload.c_str(), true);
-  Serial.printf("[INFO] MQTT 告警发送: %s\n", ok ? "成功" : "失败");
+  bool ok = g_mqtt.publish(MQTT_ALERT_TOPIC, payload.c_str(), true);
+  Serial.printf("[INFO] MQTT publish %s: %s\n", ok ? "success" : "failed", title);
 }
 
-void scanSensors() {
-  // 按照接线定义读取，若你的模块逻辑反相请改成 !digitalRead(...)
-  bool bedroomPir = digitalRead(PIN_PIR_BEDROOM) == HIGH;
-  bool toiletPir = digitalRead(PIN_PIR_TOILET) == HIGH;
-  bool toiletDoorClosed = digitalRead(PIN_DOOR_TOILET) == HIGH;
-  bool bedOccupied = digitalRead(PIN_BED_PRESSURE) == HIGH;
+void scanSensors(uint32_t nowMs) {
+  // Adjust logic if your sensors are active-low.
+  const bool bedroomPir = digitalRead(PIN_PIR_BEDROOM) == HIGH;
+  const bool toiletPir = digitalRead(PIN_PIR_TOILET) == HIGH;
+  const bool toiletDoorClosed = digitalRead(PIN_DOOR_TOILET) == HIGH;
+  const bool bedOccupied = digitalRead(PIN_BED_PRESSURE) == HIGH;
 
-  uint32_t now = millis();
-
-  if (bedroomPir && !lastBedroomPir) {
-    stats.bedroomPirTriggersToday++;
-    stats.totalTriggersToday++;
-    stats.lastActivityMs = now;
-    stats.bedroomPirTriggeredToday = true;
+  if (bedroomPir && !g_state.lastBedroomPir) {
+    g_state.bedroomPirTriggersToday++;
+    g_state.totalTriggersToday++;
+    g_state.lastActivityMs = nowMs;
   }
 
-  if (toiletPir && !lastToiletPir) {
-    stats.totalTriggersToday++;
-    stats.lastActivityMs = now;
+  if (toiletPir && !g_state.lastToiletPir) {
+    g_state.totalTriggersToday++;
+    g_state.lastActivityMs = nowMs;
   }
 
-  if (toiletDoorClosed != lastToiletDoorClosed) {
-    stats.toiletDoorTriggersToday++;
-    stats.totalTriggersToday++;
-    stats.lastActivityMs = now;
+  if (toiletDoorClosed != g_state.lastToiletDoorClosed) {
+    g_state.toiletDoorChangesToday++;
+    g_state.totalTriggersToday++;
+    g_state.lastActivityMs = nowMs;
   }
 
-  if (bedOccupied && !lastBedOccupied) {
-    stats.bedOccupiedStartMs = now;
+  // First "get out of bed" event in morning window is today's wakeup time.
+  const uint16_t minuteOfDay = minuteOfDayFromUptime(nowMs);
+  if (g_state.lastBedOccupied && !bedOccupied &&
+      g_state.wakeupMinuteToday == INVALID_WAKEUP_MINUTE &&
+      minuteOfDay >= 4 * 60 && minuteOfDay <= 12 * 60) {
+    g_state.wakeupMinuteToday = minuteOfDay;
   }
 
+  if (bedOccupied && !g_state.lastBedOccupied) {
+    g_state.bedOccupiedStartMs = nowMs;
+  }
   if (!bedOccupied) {
-    stats.bedOccupiedStartMs = 0;
-    stats.bedWarnSent = false;
+    g_state.bedOccupiedStartMs = 0;
+    g_state.bedWarnSent = false;
   }
 
   if (toiletDoorClosed && toiletPir) {
-    if (stats.toiletEnterMs == 0) {
-      stats.toiletEnterMs = now;
+    if (g_state.toiletEnterMs == 0) {
+      g_state.toiletEnterMs = nowMs;
     }
   } else {
-    stats.toiletEnterMs = 0;
-    stats.toiletWarnSent = false;
-    stats.toiletCriticalSent = false;
+    g_state.toiletEnterMs = 0;
+    g_state.toiletWarnSent = false;
+    g_state.toiletCriticalSent = false;
   }
 
-  stats.toiletPirState = toiletPir;
-  stats.toiletDoorClosed = toiletDoorClosed;
-  stats.bedOccupied = bedOccupied;
+  g_state.bedroomPir = bedroomPir;
+  g_state.toiletPir = toiletPir;
+  g_state.toiletDoorClosed = toiletDoorClosed;
+  g_state.bedOccupied = bedOccupied;
 
-  lastBedroomPir = bedroomPir;
-  lastToiletPir = toiletPir;
-  lastToiletDoorClosed = toiletDoorClosed;
-  lastBedOccupied = bedOccupied;
+  g_state.lastBedroomPir = bedroomPir;
+  g_state.lastToiletPir = toiletPir;
+  g_state.lastToiletDoorClosed = toiletDoorClosed;
+  g_state.lastBedOccupied = bedOccupied;
 }
 
-void evaluateRules() {
-  uint32_t now = millis();
+void evaluateRules(uint32_t nowMs) {
+  const uint16_t minuteOfDay = minuteOfDayFromUptime(nowMs);
+  const uint16_t wakeupBaseline = averageWakeupMinute();
+  const uint16_t activityBaseline = averageTriggerCount();
 
-  // 规则 2：厕所滞留
-  if (stats.toiletEnterMs > 0) {
-    uint32_t stay = now - stats.toiletEnterMs;
-    if (stay > TOILET_WARN_MS && !stats.toiletWarnSent) {
-      updateRisk(RiskLevel::MEDIUM);
+  // Rule A: Wakeup anomaly
+  if (!g_state.wakeupWarnSent &&
+      minuteOfDay > static_cast<uint16_t>(wakeupBaseline + WAKEUP_TOLERANCE_MINUTES) &&
+      g_state.bedOccupied &&
+      g_state.bedroomPirTriggersToday < 2) {
+    g_state.wakeupWarnSent = true;
+    escalateRisk(AlertLevel::WARNING);
+    Serial.println("[ALERT] Wakeup anomaly: still in bed and low bedroom activity.");
+    publishAlert("Wakeup Anomaly", "Wakeup is later than baseline by over 90 minutes.", AlertLevel::WARNING);
+  }
+
+  // Rule B: Toilet stay too long (12 min warning, 18 min critical)
+  if (g_state.toiletEnterMs > 0) {
+    const uint32_t stayMs = nowMs - g_state.toiletEnterMs;
+
+    if (stayMs > TOILET_WARN_MS && !g_state.toiletWarnSent) {
+      g_state.toiletWarnSent = true;
+      escalateRisk(AlertLevel::WARNING);
       beep(200, 2);
-      stats.toiletWarnSent = true;
-      Serial.println("[ALERT] 厕所滞留超过 12 分钟，已本地提醒");
+      Serial.println("[ALERT] Toilet stay exceeded 12 minutes (local warning).");
+      publishAlert("Toilet Stay Warning", "Toilet stay exceeded 12 minutes.", AlertLevel::WARNING);
     }
-    if (stay > TOILET_CRITICAL_MS && !stats.toiletCriticalSent) {
-      updateRisk(RiskLevel::HI);
+
+    if (stayMs > TOILET_CRITICAL_MS && !g_state.toiletCriticalSent) {
+      g_state.toiletCriticalSent = true;
+      escalateRisk(AlertLevel::CRITICAL);
       beep(300, 4);
-      sendRemoteAlert("厕所滞留高风险", "门关闭且持续有人，超过 18 分钟", RiskLevel::HI);
-      stats.toiletCriticalSent = true;
-      Serial.println("[ALERT] 厕所滞留超过 18 分钟，已远程告警");
+      Serial.println("[ALERT] Toilet stay exceeded 18 minutes (critical).");
+      publishAlert("Toilet Stay Critical", "Toilet stay exceeded 18 minutes.", AlertLevel::CRITICAL);
     }
   }
 
-  // 规则 1：起床异常（示例按开机以来分钟模拟当天时间）
-  uint32_t minuteOfDay = (now / MINUTE) % (24 * 60);
-  bool wakeupLate = minuteOfDay > (AVG_WAKEUP_MINUTE + WAKEUP_DELAY_TOLERANCE);
-  if (wakeupLate && stats.bedOccupied && stats.bedroomPirTriggersToday < 2 && !stats.wakeupWarnSent) {
-    updateRisk(RiskLevel::LIGHT);
-    stats.wakeupWarnSent = true;
-    Serial.println("[ALERT] 起床异常：晚于基线且仍卧床、活动少");
-  }
-
-  // 规则 3：活动量骤降
-  if (minuteOfDay > 20 * 60) {  // 晚上 20:00 之后统计
-    if (stats.totalTriggersToday < (avgTriggersHistory5Days / 2)) {
-      updateRisk(RiskLevel::LIGHT);
-      Serial.println("[ALERT] 今日活动量低于历史平均 50%");
-    }
-  }
-
-  // 规则 4：长时间无活动（非夜间）
-  bool normalSleepTime = (minuteOfDay >= 23 * 60 || minuteOfDay <= 6 * 60);
-  if (!normalSleepTime && (now - stats.lastActivityMs > NO_ACTIVITY_WARN_MS) && !stats.noActivityWarnSent) {
-    updateRisk(RiskLevel::MEDIUM);
-    stats.noActivityWarnSent = true;
-    beep(180, 2);
-    Serial.println("[ALERT] 连续 2 小时无明显活动");
-  }
-
-  // 补充：白天长时间卧床
-  bool dayTime = (minuteOfDay >= 8 * 60 && minuteOfDay <= 21 * 60);
-  if (dayTime && stats.bedOccupied && stats.bedOccupiedStartMs > 0) {
-    if (now - stats.bedOccupiedStartMs > BED_WARN_MS && !stats.bedWarnSent) {
-      updateRisk(RiskLevel::MEDIUM);
-      stats.bedWarnSent = true;
+  // Rule C: Long daytime bed occupancy
+  if (!g_state.bedWarnSent && isDaytimeWindow(minuteOfDay) && g_state.bedOccupied && g_state.bedOccupiedStartMs > 0) {
+    const uint32_t bedDurationMs = nowMs - g_state.bedOccupiedStartMs;
+    if (bedDurationMs > BED_WARN_MS) {
+      g_state.bedWarnSent = true;
+      escalateRisk(AlertLevel::WARNING);
       beep(200, 3);
-      sendRemoteAlert("长时间卧床", "白天连续 3 小时检测到床上有人", RiskLevel::MEDIUM);
-      Serial.println("[ALERT] 白天长时间卧床，已预警");
+      Serial.println("[ALERT] Bed occupied over 3 hours in daytime.");
+      publishAlert("Long Bed Occupancy", "Daytime bed occupancy exceeded 3 hours.", AlertLevel::WARNING);
     }
+  }
+
+  // Rule D: Long no-activity window (exclude sleep time)
+  if (!g_state.noActivityWarnSent && !isSleepWindow(minuteOfDay) &&
+      (nowMs - g_state.lastActivityMs > NO_ACTIVITY_WARN_MS)) {
+    g_state.noActivityWarnSent = true;
+    escalateRisk(AlertLevel::WARNING);
+    beep(180, 2);
+    Serial.println("[ALERT] No obvious activity for over 2 hours.");
+    publishAlert("No Activity Warning", "No obvious activity for over 2 hours.", AlertLevel::WARNING);
+  }
+
+  // Rule E: Daily activity drop (check after 20:00)
+  if (!g_state.activityDropWarnSent && minuteOfDay > 20 * 60 &&
+      g_state.totalTriggersToday < (activityBaseline / 2)) {
+    g_state.activityDropWarnSent = true;
+    escalateRisk(AlertLevel::WARNING);
+    Serial.println("[ALERT] Daily activity dropped below 50% of baseline.");
+    publishAlert("Activity Drop Warning", "Today's activity is below 50% of baseline.", AlertLevel::WARNING);
   }
 }
 
-void serialDashboard() {
-  uint32_t now = millis();
-  if (now - lastReportMs < 5000) {
+String currentStatusLabel() {
+  if (g_state.riskToday == AlertLevel::CRITICAL) {
+    return "高风险";
+  }
+  if (g_state.riskToday == AlertLevel::WARNING) {
+    return "中度异常";
+  }
+  return "正常";
+}
+
+void printSerialDashboard(uint32_t nowMs) {
+  if (nowMs - g_state.lastDashboardMs < 5000) {
     return;
   }
-  lastReportMs = now;
+  g_state.lastDashboardMs = nowMs;
 
-  Serial.println("================ 状态看板 ================");
-  Serial.printf("老人状态：%s\n", riskToString(stats.currentRisk));
-  Serial.printf("今日起床：%s\n", stats.wakeupWarnSent ? "偏晚" : "正常");
-  Serial.printf("卧床状态：%s\n", stats.bedOccupied ? "有人在床" : "离床");
-  Serial.printf("厕所状态：%s\n", (stats.toiletDoorClosed && stats.toiletPirState) ? "有人滞留中" : "正常");
-  Serial.printf("今日活动量(触发数)：%u\n", stats.totalTriggersToday);
-  Serial.println("==========================================");
+  const uint16_t minuteOfDay = minuteOfDayFromUptime(nowMs);
+  Serial.println("=============== Senior Status Dashboard ===============");
+  Serial.printf("Risk today: %s\n", alertLevelToChinese(g_state.riskToday));
+  Serial.printf("Current minute of day: %u\n", minuteOfDay);
+  Serial.printf("Wakeup today: %s\n", g_state.wakeupMinuteToday == INVALID_WAKEUP_MINUTE ? "N/A" : "Recorded");
+  Serial.printf("Bed state: %s\n", g_state.bedOccupied ? "occupied" : "empty");
+  Serial.printf("Toilet state: %s\n", (g_state.toiletDoorClosed && g_state.toiletPir) ? "staying" : "normal");
+  Serial.printf("Today's trigger count: %u\n", g_state.totalTriggersToday);
+  Serial.println("=======================================================");
+}
+
+void handleApiStatus() {
+  JsonDocument doc;
+  const uint32_t nowMs = millis();
+  const uint16_t nowMinute = minuteOfDayFromUptime(nowMs);
+
+  doc["status_cn"] = currentStatusLabel();
+  doc["risk"] = alertLevelToString(g_state.riskToday);
+  doc["risk_cn"] = alertLevelToChinese(g_state.riskToday);
+  doc["minute_of_day"] = nowMinute;
+  doc["wakeup_recorded"] = g_state.wakeupMinuteToday != INVALID_WAKEUP_MINUTE;
+  doc["bed_occupied"] = g_state.bedOccupied;
+  doc["toilet_door_closed"] = g_state.toiletDoorClosed;
+  doc["toilet_pir"] = g_state.toiletPir;
+  doc["today_total_triggers"] = g_state.totalTriggersToday;
+  doc["avg_total_triggers_5d"] = averageTriggerCount();
+  doc["avg_wakeup_minute_5d"] = averageWakeupMinute();
+  doc["wakeup_warn"] = g_state.wakeupWarnSent;
+  doc["toilet_warn"] = g_state.toiletWarnSent;
+  doc["toilet_critical"] = g_state.toiletCriticalSent;
+  doc["bed_warn"] = g_state.bedWarnSent;
+  doc["no_activity_warn"] = g_state.noActivityWarnSent;
+  doc["activity_drop_warn"] = g_state.activityDropWarnSent;
+
+  String payload;
+  serializeJson(doc, payload);
+  g_web.send(200, "application/json; charset=utf-8", payload);
+}
+
+String htmlPage() {
+  String page;
+  page.reserve(2800);
+  page += "<!doctype html><html><head><meta charset='utf-8'>";
+  page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
+  page += "<title>Privacy Alert Dashboard</title>";
+  page += "<style>";
+  page += "body{font-family:Arial,Helvetica,sans-serif;background:#f6f7fb;margin:0;padding:20px;color:#1d2433;}";
+  page += ".card{background:#fff;border-radius:12px;padding:16px;margin-bottom:12px;box-shadow:0 3px 12px rgba(0,0,0,.08);}";
+  page += ".title{font-size:20px;font-weight:700;margin-bottom:8px;}";
+  page += ".risk-normal{color:#147a3d;font-weight:700;}.risk-warning{color:#a66b00;font-weight:700;}.risk-critical{color:#b5121b;font-weight:700;}";
+  page += ".k{color:#5e6b82}.v{font-weight:700}.grid{display:grid;grid-template-columns:1fr 1fr;gap:10px;}";
+  page += "@media(max-width:760px){.grid{grid-template-columns:1fr;}}";
+  page += "</style></head><body>";
+  page += "<div class='card'><div class='title'>独居老人隐私预警系统</div>";
+  page += "<div id='riskText' class='risk-normal'>加载中...</div></div>";
+  page += "<div class='card grid'>";
+  page += "<div><span class='k'>今日活动触发</span><div class='v' id='total'>-</div></div>";
+  page += "<div><span class='k'>5日平均触发</span><div class='v' id='avg'>-</div></div>";
+  page += "<div><span class='k'>卧床状态</span><div class='v' id='bed'>-</div></div>";
+  page += "<div><span class='k'>厕所状态</span><div class='v' id='toilet'>-</div></div>";
+  page += "<div><span class='k'>起床异常</span><div class='v' id='wakeup'>-</div></div>";
+  page += "<div><span class='k'>活动量骤降</span><div class='v' id='drop'>-</div></div>";
+  page += "</div>";
+  page += "<script>";
+  page += "async function pull(){";
+  page += "const r=await fetch('/api/status');const d=await r.json();";
+  page += "const risk=document.getElementById('riskText');";
+  page += "risk.textContent='风险等级：'+d.risk_cn+'（状态：'+d.status_cn+'）';";
+  page += "risk.className=d.risk==='critical'?'risk-critical':(d.risk==='warning'?'risk-warning':'risk-normal');";
+  page += "document.getElementById('total').textContent=d.today_total_triggers;";
+  page += "document.getElementById('avg').textContent=d.avg_total_triggers_5d;";
+  page += "document.getElementById('bed').textContent=d.bed_occupied?'床上有人':'已离床';";
+  page += "document.getElementById('toilet').textContent=(d.toilet_door_closed&&d.toilet_pir)?'疑似滞留':'正常';";
+  page += "document.getElementById('wakeup').textContent=d.wakeup_warn?'异常':'正常';";
+  page += "document.getElementById('drop').textContent=d.activity_drop_warn?'异常':'正常';";
+  page += "} pull(); setInterval(pull,3000);";
+  page += "</script></body></html>";
+  return page;
+}
+
+void handleRoot() {
+  g_web.send(200, "text/html; charset=utf-8", htmlPage());
+}
+
+void setupWebServer() {
+  g_web.on("/", HTTP_GET, handleRoot);
+  g_web.on("/api/status", HTTP_GET, handleApiStatus);
+  g_web.begin();
+  Serial.println("[INFO] Web dashboard started: http://<esp32-ip>/");
 }
 
 void setup() {
@@ -328,25 +541,30 @@ void setup() {
   pinMode(PIN_BUZZER, OUTPUT);
   digitalWrite(PIN_BUZZER, LOW);
 
-  stats.lastActivityMs = millis();
+  const uint32_t nowMs = millis();
+  g_state.uptimeDay = nowMs / DAY_MS;
+  g_state.lastActivityMs = nowMs;
 
-  connectWiFi();
-  connectMqtt();
+  ensureWifiConnected();
+  setupWebServer();
+  g_mqtt.setServer(MQTT_BROKER_ADDR, MQTT_BROKER_PORT);
+  ensureMqttConnected(nowMs);
 
-  Serial.println("[INFO] 系统启动完成，开始监测...");
+  Serial.println("[INFO] Privacy Alert system started.");
 }
 
 void loop() {
-  stats.currentRisk = RiskLevel::NORMAL;  // 每轮重新评估当前风险
+  const uint32_t nowMs = millis();
 
-  if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
-    connectMqtt();
-  }
-  mqttClient.loop();
+  rolloverDayIfNeeded(nowMs);
+  ensureWifiConnected();
+  ensureMqttConnected(nowMs);
+  g_mqtt.loop();
+  g_web.handleClient();
 
-  scanSensors();
-  evaluateRules();
-  serialDashboard();
+  scanSensors(nowMs);
+  evaluateRules(nowMs);
+  printSerialDashboard(nowMs);
 
   delay(100);
 }
