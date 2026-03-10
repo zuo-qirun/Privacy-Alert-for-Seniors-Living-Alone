@@ -398,7 +398,21 @@ uint16_t averageWakeupMinute() {
   return static_cast<uint16_t>(sum / count);
 }
 
+void ensureWifiStackReady() {
+  if (g_wifiStackReady) {
+    return;
+  }
+
+  // 先显式初始化 STA 模式，确保底层 tcpip/lwIP 邮箱已创建。
+  // 避免在网络栈未就绪前直接调用 WiFi.status() 触发 Invalid mbox 断言。
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  g_wifiStackReady = true;
+}
+
 void ensureWifiConnected() {
+  ensureWifiStackReady();
+
   if (WiFi.status() == WL_CONNECTED) {
     stopApConfigMode();
     return;
