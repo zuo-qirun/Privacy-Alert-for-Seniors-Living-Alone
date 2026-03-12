@@ -61,13 +61,19 @@ struct AppConfig {
   bool demoMode = false;
   bool bedActiveLow = true;
 };
+struct TimeContext {
+  bool hasRealTime = false;
+  uint16_t minuteOfDay = 0;
+  uint32_t dayKey = 0;
+};
 struct RuntimeState {
   bool bedroomPir = false, toiletPir = false, toiletDoorClosed = false, bedOccupied = false;
   bool lastBedroomPir = false, lastToiletPir = false, lastToiletDoorClosed = false, lastBedOccupied = false;
   uint32_t lastActivityMs = 0, bedOccupiedStartMs = 0, toiletEnterMs = 0;
   uint32_t lastMqttRetryMs = 0, lastMqttHeartbeatMs = 0, lastMqttSensorPublishMs = 0;
   bool sensorStateChanged = false;
-  uint32_t uptimeDay = 0;
+  uint32_t dayKey = 0;
+  bool dayKeyHasRealTime = false;
   uint16_t bedroomPirTriggersToday = 0, toiletDoorChangesToday = 0, totalTriggersToday = 0, wakeupMinuteToday = INVALID_WAKEUP_MINUTE;
   bool wakeupWarnSent = false, toiletWarnSent = false, toiletCriticalSent = false, bedWarnSent = false, noActivityWarnSent = false, activityDropWarnSent = false;
   AlertLevel riskToday = AlertLevel::INFO;
@@ -161,9 +167,29 @@ String formatNowTime() {
   char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &now); return String(buf);
 }
 
+bool tryGetLocalTimeInfo(tm& now) {
+  return g_timeSynced && getLocalTime(&now, 10);
+}
+
+TimeContext buildTimeContext(uint32_t nowMs) {
+  tm now{};
+  if (tryGetLocalTimeInfo(now)) {
+    TimeContext ctx;
+    ctx.hasRealTime = true;
+    ctx.minuteOfDay = static_cast<uint16_t>(now.tm_hour * 60 + now.tm_min);
+    ctx.dayKey = static_cast<uint32_t>((now.tm_year + 1900) * 1000 + now.tm_yday);
+    return ctx;
+  }
+
+  TimeContext ctx;
+  ctx.minuteOfDay = minuteOfDayFromUptime(nowMs);
+  ctx.dayKey = nowMs / DAY_MS;
+  return ctx;
+}
+
 bool saveConfig() {
   JsonDocument doc;
-  doc["config_version"] = 3;
+  doc["config_version"] = 4;
   doc["ssid"] = g_config.ssid;
   doc["pass"] = g_config.pass;
   doc["demo_mode"] = g_config.demoMode;
@@ -189,9 +215,19 @@ void requestTimeSync() {
 }
 
 void updateTimeSyncStatus(uint32_t nowMs) {
-  if (WiFi.status() != WL_CONNECTED) { g_timeSynced = false; return; }
-  if (!g_timeSyncRequested || (nowMs - g_lastTimeSyncTryMs > 30000)) requestTimeSync();
-  tm now{}; if (getLocalTime(&now, 10)) g_timeSynced = true;
+  tm now{};
+  if (getLocalTime(&now, 10)) {
+    g_timeSynced = true;
+    if (WiFi.status() == WL_CONNECTED && (!g_timeSyncRequested || (nowMs - g_lastTimeSyncTryMs > 30000))) {
+      requestTimeSync();
+    }
+    return;
+  }
+
+  g_timeSynced = false;
+  if (WiFi.status() == WL_CONNECTED && (!g_timeSyncRequested || (nowMs - g_lastTimeSyncTryMs > 30000))) {
+    requestTimeSync();
+  }
 }
 
 void ensureWifiStackReady() {
@@ -348,10 +384,18 @@ void pushDayRecord(const DayRecord& record) {
 }
 
 void rolloverDayIfNeeded(uint32_t nowMs) {
-  uint32_t currentDay = nowMs / DAY_MS;
-  if (currentDay == g_state.uptimeDay) return;
+  const TimeContext ctx = buildTimeContext(nowMs);
+  if (ctx.hasRealTime != g_state.dayKeyHasRealTime) {
+    g_state.dayKey = ctx.dayKey;
+    g_state.dayKeyHasRealTime = ctx.hasRealTime;
+    return;
+  }
+  if (ctx.dayKey == g_state.dayKey) return;
   DayRecord done{}; done.totalTriggers = g_state.totalTriggersToday; done.wakeupMinute = g_state.wakeupMinuteToday;
-  pushDayRecord(done); g_state.uptimeDay = currentDay; resetDailyFlagsAndCounters(); g_state.lastActivityMs = nowMs;
+  pushDayRecord(done);
+  g_state.dayKey = ctx.dayKey;
+  g_state.dayKeyHasRealTime = ctx.hasRealTime;
+  resetDailyFlagsAndCounters();
 }
 
 uint16_t averageTriggerCount() {
@@ -381,7 +425,7 @@ void scanSensors(uint32_t nowMs) {
   if (toiletPir && !g_state.lastToiletPir) { g_state.totalTriggersToday++; g_state.lastActivityMs = nowMs; }
   if (toiletDoorClosed != g_state.lastToiletDoorClosed) { g_state.toiletDoorChangesToday++; g_state.totalTriggersToday++; g_state.lastActivityMs = nowMs; }
 
-  const uint16_t minuteOfDay = minuteOfDayFromUptime(nowMs);
+  const uint16_t minuteOfDay = buildTimeContext(nowMs).minuteOfDay;
   if (g_state.lastBedOccupied && !bedOccupied && g_state.wakeupMinuteToday == INVALID_WAKEUP_MINUTE && minuteOfDay >= 240 && minuteOfDay <= 720) {
     g_state.wakeupMinuteToday = minuteOfDay;
   }
@@ -403,8 +447,41 @@ void scanSensors(uint32_t nowMs) {
   g_state.lastBedroomPir = bedroomPir; g_state.lastToiletPir = toiletPir; g_state.lastToiletDoorClosed = toiletDoorClosed; g_state.lastBedOccupied = bedOccupied;
 }
 
+AlertLevel computeCurrentRisk(uint32_t nowMs, uint16_t minuteOfDay, uint16_t wakeupBaseline, uint16_t activityBaseline) {
+  if (g_state.toiletEnterMs > 0) {
+    const uint32_t stayMs = nowMs - g_state.toiletEnterMs;
+    if (stayMs > toiletCriticalThresholdMs()) return AlertLevel::CRITICAL;
+    if (stayMs > toiletWarnThresholdMs()) return AlertLevel::WARNING;
+  }
+
+  if (g_config.demoMode) {
+    if (g_state.bedOccupied && g_state.bedOccupiedStartMs > 0 &&
+        (nowMs - g_state.bedOccupiedStartMs > DEMO_WAKEUP_STAY_MS)) {
+      return AlertLevel::WARNING;
+    }
+  } else if (minuteOfDay > static_cast<uint16_t>(wakeupBaseline + WAKEUP_TOLERANCE_MINUTES) &&
+             g_state.bedOccupied && g_state.bedroomPirTriggersToday < 2) {
+    return AlertLevel::WARNING;
+  }
+
+  if (isDaytimeWindow(minuteOfDay) && g_state.bedOccupied && g_state.bedOccupiedStartMs > 0 &&
+      (nowMs - g_state.bedOccupiedStartMs > bedWarnThresholdMs())) {
+    return AlertLevel::WARNING;
+  }
+
+  if (!isSleepWindow(minuteOfDay) && nowMs - g_state.lastActivityMs > noActivityWarnThresholdMs()) {
+    return AlertLevel::WARNING;
+  }
+
+  if (minuteOfDay > 20 * 60 && g_state.totalTriggersToday < (activityBaseline / 2)) {
+    return AlertLevel::WARNING;
+  }
+
+  return AlertLevel::INFO;
+}
+
 void evaluateRules(uint32_t nowMs) {
-  const uint16_t minuteOfDay = minuteOfDayFromUptime(nowMs);
+  const uint16_t minuteOfDay = buildTimeContext(nowMs).minuteOfDay;
   const uint16_t wakeupBaseline = averageWakeupMinute();
   const uint16_t activityBaseline = averageTriggerCount();
 
@@ -438,6 +515,13 @@ void evaluateRules(uint32_t nowMs) {
   if (!g_state.activityDropWarnSent && minuteOfDay > 20 * 60 && g_state.totalTriggersToday < (activityBaseline / 2)) {
     g_state.activityDropWarnSent = true; escalateRisk(AlertLevel::WARNING); publishAlert("Activity Drop Warning", "Today's activity < 50% baseline.", AlertLevel::WARNING);
   }
+}
+
+void applyRiskFallbackNow(uint32_t nowMs) {
+  const uint16_t minuteOfDay = buildTimeContext(nowMs).minuteOfDay;
+  const uint16_t wakeupBaseline = averageWakeupMinute();
+  const uint16_t activityBaseline = averageTriggerCount();
+  g_state.riskToday = computeCurrentRisk(nowMs, minuteOfDay, wakeupBaseline, activityBaseline);
 }
 
 void printPinSnapshot() {
@@ -542,10 +626,12 @@ String currentStatusLabel() {
 void handleApiStatus() {
   JsonDocument doc;
   uint32_t nowMs = millis();
+  const TimeContext timeCtx = buildTimeContext(nowMs);
   doc["status_cn"] = currentStatusLabel();
   doc["risk"] = alertLevelToString(g_state.riskToday);
   doc["risk_cn"] = alertLevelToChinese(g_state.riskToday);
-  doc["minute_of_day"] = minuteOfDayFromUptime(nowMs);
+  doc["minute_of_day"] = timeCtx.minuteOfDay;
+  doc["using_real_time"] = timeCtx.hasRealTime;
   doc["wakeup_recorded"] = g_state.wakeupMinuteToday != INVALID_WAKEUP_MINUTE;
   doc["bedroom_pir"] = g_state.bedroomPir;
   doc["bed_occupied"] = g_state.bedOccupied;
@@ -629,6 +715,11 @@ void handleApiDevConfig() {
   g_web.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
 }
 
+void handleApiDevRiskDrop() {
+  applyRiskFallbackNow(millis());
+  g_web.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+}
+
 void handleCaptiveRedirect() {
   String url = "http://" + WiFi.softAPIP().toString() + "/";
   g_web.sendHeader("Location", url, true);
@@ -676,6 +767,7 @@ String htmlPage() {
   page += "<label><input type='checkbox' id='demoMode'> 演示模式（赖床10秒告警，厕所阈值1秒；关闭后恢复）</label>";
   page += "<div style='margin-top:8px;color:#5e6b82;'>引脚已在程序中固定，如需改线请修改文件顶部常量后重新烧录。</div>";
   page += "<div><label><input type='checkbox' id='bedActiveLow'> 床压低电平=在床（未勾选则高电平=在床）</label></div>";
+  page += "<div style='margin-top:10px;'><button onclick='dropRiskNow()'>风险等级直接回落</button></div>";
   page += "<div class='grid' style='margin-top:12px;'>";
   page += "<div><span class='k'>卧室 PIR</span><div class='v' id='devBedroomPir'>-</div></div>";
   page += "<div><span class='k'>厕所 PIR</span><div class='v' id='devToiletPir'>-</div></div>";
@@ -693,9 +785,10 @@ String htmlPage() {
   page += "<script>let titleClick=0,lastClickAt=0,devVisible=false;";
   page += "async function refreshDevControls(){try{const r=await fetch('/api/dev-config?t='+Date.now(),{cache:'no-store'});const d=await r.json();document.getElementById('demoMode').checked=!!d.demo_mode;document.getElementById('bedActiveLow').checked=(d.bed_active_low!==false);}catch(e){}}";
   page += "document.getElementById('appTitle').addEventListener('click',()=>{const now=Date.now();if(now-lastClickAt>1500)titleClick=0;titleClick++;lastClickAt=now;if(titleClick>=5){devVisible=!devVisible;document.getElementById('devPanel').classList.toggle('hidden',!devVisible);refreshDevControls();titleClick=0;}});";
-  page += "async function pull(){try{const r=await fetch('/api/status?t='+Date.now(),{cache:'no-store'});const d=await r.json();const risk=document.getElementById('riskText');risk.textContent='风险等级：'+d.risk_cn+'（状态：'+d.status_cn+'）';risk.className=d.risk==='critical'?'risk-critical':(d.risk==='warning'?'risk-warning':'risk-normal');document.getElementById('nowTime').textContent=d.now_time;document.getElementById('total').textContent=d.today_total_triggers;document.getElementById('avg').textContent=d.avg_total_triggers_5d;document.getElementById('bed').textContent=d.bed_occupied?'床上有人':'已离床';document.getElementById('bedRaw').textContent=d.bed_raw;document.getElementById('toilet').textContent=(d.toilet_door_closed&&d.toilet_pir)?'疑似滞留':'正常';document.getElementById('wakeup').textContent=d.wakeup_warn?'异常':'正常';document.getElementById('drop').textContent=d.activity_drop_warn?'异常':'正常';document.getElementById('net').textContent=d.wifi_connected?('已联网：'+d.wifi_ssid):'未联网（AP 配网中）';document.getElementById('ip').textContent=d.wifi_ip;document.getElementById('pinBedPir').textContent=d.pin_pir_bedroom;document.getElementById('pinToiPir').textContent=d.pin_pir_toilet;document.getElementById('pinDoor').textContent=d.pin_door_toilet;document.getElementById('pinBed').textContent=d.pin_bed_pressure;document.getElementById('pinBuz').textContent=d.pin_buzzer;document.getElementById('devBedroomPir').textContent=d.bedroom_pir?'触发':'未触发';document.getElementById('devToiletPir').textContent=d.toilet_pir?'触发':'未触发';document.getElementById('devDoorState').textContent=d.toilet_door_closed?'关门':'开门';document.getElementById('devDoorRaw').textContent=d.door_raw;document.getElementById('devBedState').textContent=d.bed_occupied?'检测到在床':'检测到离床';document.getElementById('devBedRaw').textContent=d.bed_raw;document.getElementById('devBuzzer').textContent=d.buzzer_raw?'输出中':'关闭';document.getElementById('devWifi').textContent=d.wifi_connected?'已连接':'未连接';document.getElementById('devTimeSync').textContent=d.time_synced?'已同步':'未同步';document.getElementById('devMinuteOfDay').textContent=d.minute_of_day;const showCfg=!d.wifi_connected;document.getElementById('cfgForm').style.display=showCfg?'block':'none';document.getElementById('apTip').style.display=showCfg?'block':'none';document.getElementById('apSsid').textContent=d.ap_ssid;document.getElementById('apIp').textContent=d.ap_ip;}catch(e){document.getElementById('net').textContent='状态拉取失败';}}";
+  page += "async function pull(){try{const r=await fetch('/api/status?t='+Date.now(),{cache:'no-store'});const d=await r.json();const risk=document.getElementById('riskText');risk.textContent='风险等级：'+d.risk_cn+'（状态：'+d.status_cn+'）';risk.className=d.risk==='critical'?'risk-critical':(d.risk==='warning'?'risk-warning':'risk-normal');document.getElementById('nowTime').textContent=d.now_time;document.getElementById('total').textContent=d.today_total_triggers;document.getElementById('avg').textContent=d.avg_total_triggers_5d;document.getElementById('bed').textContent=d.bed_occupied?'床上有人':'已离床';document.getElementById('bedRaw').textContent=d.bed_raw;document.getElementById('toilet').textContent=(d.toilet_door_closed&&d.toilet_pir)?'疑似滞留':'正常';document.getElementById('wakeup').textContent=d.wakeup_warn?'异常':'正常';document.getElementById('drop').textContent=d.activity_drop_warn?'异常':'正常';document.getElementById('net').textContent=d.wifi_connected?('已联网：'+d.wifi_ssid):'未联网（AP 配网中）';document.getElementById('ip').textContent=d.wifi_ip;document.getElementById('pinBedPir').textContent=d.pin_pir_bedroom;document.getElementById('pinToiPir').textContent=d.pin_pir_toilet;document.getElementById('pinDoor').textContent=d.pin_door_toilet;document.getElementById('pinBed').textContent=d.pin_bed_pressure;document.getElementById('pinBuz').textContent=d.pin_buzzer;document.getElementById('devBedroomPir').textContent=d.bedroom_pir?'触发':'未触发';document.getElementById('devToiletPir').textContent=d.toilet_pir?'触发':'未触发';document.getElementById('devDoorState').textContent=d.toilet_door_closed?'关门':'开门';document.getElementById('devDoorRaw').textContent=d.door_raw;document.getElementById('devBedState').textContent=d.bed_occupied?'检测到在床':'检测到离床';document.getElementById('devBedRaw').textContent=d.bed_raw;document.getElementById('devBuzzer').textContent=d.buzzer_raw?'输出中':'关闭';document.getElementById('devWifi').textContent=d.wifi_connected?'已连接':'未连接';document.getElementById('devTimeSync').textContent=d.time_synced?(d.using_real_time?'已同步（规则使用实时时间）':'已同步'):'未同步';document.getElementById('devMinuteOfDay').textContent=d.minute_of_day;const showCfg=!d.wifi_connected;document.getElementById('cfgForm').style.display=showCfg?'block':'none';document.getElementById('apTip').style.display=showCfg?'block':'none';document.getElementById('apSsid').textContent=d.ap_ssid;document.getElementById('apIp').textContent=d.ap_ip;}catch(e){document.getElementById('net').textContent='状态拉取失败';}}";
   page += "async function saveWifi(){const ssid=document.getElementById('ssid').value;const pass=document.getElementById('pass').value;if(!ssid){alert('SSID 不能为空');return;}const b='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass);const r=await fetch('/api/wifi-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});const d=await r.json();alert(d.ok?'已提交配网，设备正在重连':'提交失败：'+(d.msg||'unknown'));}";
   page += "async function saveDev(){const demo=document.getElementById('demoMode').checked?'1':'0';const bedActiveLow=document.getElementById('bedActiveLow').checked?'1':'0';const b='demo_mode='+demo+'&bed_active_low='+bedActiveLow;const r=await fetch('/api/dev-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});const d=await r.json();alert(d.ok?'开发者配置已保存':'保存失败');}";
+  page += "async function dropRiskNow(){const r=await fetch('/api/dev-risk-drop',{method:'POST'});const d=await r.json();alert(d.ok?'风险等级已按当前状态回落':'回落失败');pull();}";
   page += "pull();setInterval(pull,1000);</script></body></html>";
   return page;
 }
@@ -711,6 +804,7 @@ void setupWebServer() {
   g_web.on("/api/wifi-config", HTTP_POST, handleApiWifiConfig);
   g_web.on("/api/dev-config", HTTP_GET, handleApiDevConfig);
   g_web.on("/api/dev-config", HTTP_POST, handleApiDevConfig);
+  g_web.on("/api/dev-risk-drop", HTTP_POST, handleApiDevRiskDrop);
   g_web.on("/generate_204", HTTP_GET, handleGenerate204);
   g_web.on("/gen_204", HTTP_GET, handleGenerate204);
   g_web.on("/hotspot-detect.html", HTTP_GET, handleHotspotDetect);
@@ -739,7 +833,6 @@ void setup() {
   applyPinModes();
 
   uint32_t nowMs = millis();
-  g_state.uptimeDay = nowMs / DAY_MS;
   g_state.lastActivityMs = nowMs;
 
   ensureWifiConnected();
@@ -747,6 +840,9 @@ void setup() {
   g_mqtt.setServer(MQTT_BROKER_ADDR, MQTT_BROKER_PORT);
   ensureMqttConnected(nowMs);
   updateTimeSyncStatus(nowMs);
+  const TimeContext timeCtx = buildTimeContext(nowMs);
+  g_state.dayKey = timeCtx.dayKey;
+  g_state.dayKeyHasRealTime = timeCtx.hasRealTime;
 }
 
 void loop() {
