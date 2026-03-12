@@ -15,6 +15,8 @@ DEFAULT_BROKER = "bemfa.com"
 DEFAULT_PORT = 9501
 DEFAULT_TOPIC = "senioralertevents"
 DEFAULT_PRIVATE_KEY = "84810b9b5f5245fdbc1e1738837f27a9"
+MAX_LOG_LINES = 1000
+LOG_TRIM_TARGET_LINES = 800
 
 
 @dataclass
@@ -37,6 +39,7 @@ class SeniorAlertClient:
         self.event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.mqtt_client: mqtt.Client | None = None
         self.worker_lock = threading.Lock()
+        self.log_line_count = 0
 
         self.connection_state = tk.StringVar(value="未连接")
         self.last_message_time = tk.StringVar(value="-")
@@ -345,8 +348,13 @@ class SeniorAlertClient:
 
     def append_log(self, message: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
+        message = message.rstrip("\n")
+        line = f"[{stamp}] {message}\n"
+        added_lines = line.count("\n")
         self.log_box.configure(state=tk.NORMAL)
-        self.log_box.insert(tk.END, f"[{stamp}] {message}\n")
+        self.log_box.insert(tk.END, line)
+        self.log_line_count += added_lines
+        self._trim_log_if_needed()
         self.log_box.see(tk.END)
         self.log_box.configure(state=tk.DISABLED)
 
@@ -354,6 +362,14 @@ class SeniorAlertClient:
         self.log_box.configure(state=tk.NORMAL)
         self.log_box.delete("1.0", tk.END)
         self.log_box.configure(state=tk.DISABLED)
+        self.log_line_count = 0
+
+    def _trim_log_if_needed(self) -> None:
+        if self.log_line_count <= MAX_LOG_LINES:
+            return
+        lines_to_remove = self.log_line_count - LOG_TRIM_TARGET_LINES
+        self.log_box.delete("1.0", f"{lines_to_remove + 1}.0")
+        self.log_line_count = LOG_TRIM_TARGET_LINES
 
     def on_close(self) -> None:
         self.disconnect()
