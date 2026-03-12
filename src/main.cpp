@@ -547,10 +547,13 @@ void handleApiStatus() {
   doc["risk_cn"] = alertLevelToChinese(g_state.riskToday);
   doc["minute_of_day"] = minuteOfDayFromUptime(nowMs);
   doc["wakeup_recorded"] = g_state.wakeupMinuteToday != INVALID_WAKEUP_MINUTE;
+  doc["bedroom_pir"] = g_state.bedroomPir;
   doc["bed_occupied"] = g_state.bedOccupied;
   doc["bed_raw"] = digitalRead(PIN_DEFAULT_BED_PRESSURE);
   doc["toilet_door_closed"] = g_state.toiletDoorClosed;
   doc["toilet_pir"] = g_state.toiletPir;
+  doc["door_raw"] = digitalRead(PIN_DEFAULT_DOOR_TOILET);
+  doc["buzzer_raw"] = digitalRead(PIN_DEFAULT_BUZZER);
   doc["today_total_triggers"] = g_state.totalTriggersToday;
   doc["avg_total_triggers_5d"] = averageTriggerCount();
   doc["avg_wakeup_minute_5d"] = averageWakeupMinute();
@@ -638,7 +641,7 @@ void handleConnectTest() { handleCaptiveRedirect(); }
 void handleNcsi() { handleCaptiveRedirect(); }
 String htmlPage() {
   String page;
-  page.reserve(7800);
+  page.reserve(9200);
   page += "<!doctype html><html><head><meta charset='utf-8'>";
   page += "<meta name='viewport' content='width=device-width,initial-scale=1'>";
   page += "<title>独居老人隐私预警系统</title>";
@@ -673,12 +676,24 @@ String htmlPage() {
   page += "<label><input type='checkbox' id='demoMode'> 演示模式（赖床10秒告警，厕所阈值1秒；关闭后恢复）</label>";
   page += "<div style='margin-top:8px;color:#5e6b82;'>引脚已在程序中固定，如需改线请修改文件顶部常量后重新烧录。</div>";
   page += "<div><label><input type='checkbox' id='bedActiveLow'> 床压低电平=在床（未勾选则高电平=在床）</label></div>";
+  page += "<div class='grid' style='margin-top:12px;'>";
+  page += "<div><span class='k'>卧室 PIR</span><div class='v' id='devBedroomPir'>-</div></div>";
+  page += "<div><span class='k'>厕所 PIR</span><div class='v' id='devToiletPir'>-</div></div>";
+  page += "<div><span class='k'>门磁状态</span><div class='v' id='devDoorState'>-</div></div>";
+  page += "<div><span class='k'>门磁原始电平</span><div class='v' id='devDoorRaw'>-</div></div>";
+  page += "<div><span class='k'>床压状态</span><div class='v' id='devBedState'>-</div></div>";
+  page += "<div><span class='k'>床压原始电平</span><div class='v' id='devBedRaw'>-</div></div>";
+  page += "<div><span class='k'>蜂鸣器输出</span><div class='v' id='devBuzzer'>-</div></div>";
+  page += "<div><span class='k'>Wi-Fi 连接</span><div class='v' id='devWifi'>-</div></div>";
+  page += "<div><span class='k'>时间同步</span><div class='v' id='devTimeSync'>-</div></div>";
+  page += "<div><span class='k'>分钟计时</span><div class='v' id='devMinuteOfDay'>-</div></div>";
+  page += "</div>";
   page += "<div style='margin-top:10px;'><button onclick='saveDev()'>保存开发者配置</button></div></div>";
 
   page += "<script>let titleClick=0,lastClickAt=0,devVisible=false;";
   page += "async function refreshDevControls(){try{const r=await fetch('/api/dev-config?t='+Date.now(),{cache:'no-store'});const d=await r.json();document.getElementById('demoMode').checked=!!d.demo_mode;document.getElementById('bedActiveLow').checked=(d.bed_active_low!==false);}catch(e){}}";
   page += "document.getElementById('appTitle').addEventListener('click',()=>{const now=Date.now();if(now-lastClickAt>1500)titleClick=0;titleClick++;lastClickAt=now;if(titleClick>=5){devVisible=!devVisible;document.getElementById('devPanel').classList.toggle('hidden',!devVisible);refreshDevControls();titleClick=0;}});";
-  page += "async function pull(){try{const r=await fetch('/api/status?t='+Date.now(),{cache:'no-store'});const d=await r.json();const risk=document.getElementById('riskText');risk.textContent='风险等级：'+d.risk_cn+'（状态：'+d.status_cn+'）';risk.className=d.risk==='critical'?'risk-critical':(d.risk==='warning'?'risk-warning':'risk-normal');document.getElementById('nowTime').textContent=d.now_time;document.getElementById('total').textContent=d.today_total_triggers;document.getElementById('avg').textContent=d.avg_total_triggers_5d;document.getElementById('bed').textContent=d.bed_occupied?'床上有人':'已离床';document.getElementById('bedRaw').textContent=d.bed_raw;document.getElementById('toilet').textContent=(d.toilet_door_closed&&d.toilet_pir)?'疑似滞留':'正常';document.getElementById('wakeup').textContent=d.wakeup_warn?'异常':'正常';document.getElementById('drop').textContent=d.activity_drop_warn?'异常':'正常';document.getElementById('net').textContent=d.wifi_connected?('已联网：'+d.wifi_ssid):'未联网（AP 配网中）';document.getElementById('ip').textContent=d.wifi_ip;document.getElementById('pinBedPir').textContent=d.pin_pir_bedroom;document.getElementById('pinToiPir').textContent=d.pin_pir_toilet;document.getElementById('pinDoor').textContent=d.pin_door_toilet;document.getElementById('pinBed').textContent=d.pin_bed_pressure;document.getElementById('pinBuz').textContent=d.pin_buzzer;const showCfg=!d.wifi_connected;document.getElementById('cfgForm').style.display=showCfg?'block':'none';document.getElementById('apTip').style.display=showCfg?'block':'none';document.getElementById('apSsid').textContent=d.ap_ssid;document.getElementById('apIp').textContent=d.ap_ip;}catch(e){document.getElementById('net').textContent='状态拉取失败';}}";
+  page += "async function pull(){try{const r=await fetch('/api/status?t='+Date.now(),{cache:'no-store'});const d=await r.json();const risk=document.getElementById('riskText');risk.textContent='风险等级：'+d.risk_cn+'（状态：'+d.status_cn+'）';risk.className=d.risk==='critical'?'risk-critical':(d.risk==='warning'?'risk-warning':'risk-normal');document.getElementById('nowTime').textContent=d.now_time;document.getElementById('total').textContent=d.today_total_triggers;document.getElementById('avg').textContent=d.avg_total_triggers_5d;document.getElementById('bed').textContent=d.bed_occupied?'床上有人':'已离床';document.getElementById('bedRaw').textContent=d.bed_raw;document.getElementById('toilet').textContent=(d.toilet_door_closed&&d.toilet_pir)?'疑似滞留':'正常';document.getElementById('wakeup').textContent=d.wakeup_warn?'异常':'正常';document.getElementById('drop').textContent=d.activity_drop_warn?'异常':'正常';document.getElementById('net').textContent=d.wifi_connected?('已联网：'+d.wifi_ssid):'未联网（AP 配网中）';document.getElementById('ip').textContent=d.wifi_ip;document.getElementById('pinBedPir').textContent=d.pin_pir_bedroom;document.getElementById('pinToiPir').textContent=d.pin_pir_toilet;document.getElementById('pinDoor').textContent=d.pin_door_toilet;document.getElementById('pinBed').textContent=d.pin_bed_pressure;document.getElementById('pinBuz').textContent=d.pin_buzzer;document.getElementById('devBedroomPir').textContent=d.bedroom_pir?'触发':'未触发';document.getElementById('devToiletPir').textContent=d.toilet_pir?'触发':'未触发';document.getElementById('devDoorState').textContent=d.toilet_door_closed?'关门':'开门';document.getElementById('devDoorRaw').textContent=d.door_raw;document.getElementById('devBedState').textContent=d.bed_occupied?'检测到在床':'检测到离床';document.getElementById('devBedRaw').textContent=d.bed_raw;document.getElementById('devBuzzer').textContent=d.buzzer_raw?'输出中':'关闭';document.getElementById('devWifi').textContent=d.wifi_connected?'已连接':'未连接';document.getElementById('devTimeSync').textContent=d.time_synced?'已同步':'未同步';document.getElementById('devMinuteOfDay').textContent=d.minute_of_day;const showCfg=!d.wifi_connected;document.getElementById('cfgForm').style.display=showCfg?'block':'none';document.getElementById('apTip').style.display=showCfg?'block':'none';document.getElementById('apSsid').textContent=d.ap_ssid;document.getElementById('apIp').textContent=d.ap_ip;}catch(e){document.getElementById('net').textContent='状态拉取失败';}}";
   page += "async function saveWifi(){const ssid=document.getElementById('ssid').value;const pass=document.getElementById('pass').value;if(!ssid){alert('SSID 不能为空');return;}const b='ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent(pass);const r=await fetch('/api/wifi-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});const d=await r.json();alert(d.ok?'已提交配网，设备正在重连':'提交失败：'+(d.msg||'unknown'));}";
   page += "async function saveDev(){const demo=document.getElementById('demoMode').checked?'1':'0';const bedActiveLow=document.getElementById('bedActiveLow').checked?'1':'0';const b='demo_mode='+demo+'&bed_active_low='+bedActiveLow;const r=await fetch('/api/dev-config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:b});const d=await r.json();alert(d.ok?'开发者配置已保存':'保存失败');}";
   page += "pull();setInterval(pull,1000);</script></body></html>";
