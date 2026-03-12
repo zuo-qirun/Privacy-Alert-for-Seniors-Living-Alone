@@ -96,6 +96,9 @@ uint32_t g_lastAdc2WarnMs = 0;
 String g_serialLine;
 
 constexpr byte DNS_PORT = 53;
+constexpr time_t MIN_VALID_EPOCH = 1704067200;  // 2024-01-01 00:00:00 UTC
+
+bool tryGetLocalTimeInfo(tm& now);
 
 void applyPinModes() {
   pinMode(PIN_DEFAULT_PIR_BEDROOM, INPUT);
@@ -162,13 +165,16 @@ bool isManagedSensorOrActuatorPin(int pin) {
 }
 
 String formatNowTime() {
-  if (!g_timeSynced) return "N/A";
-  tm now{}; if (!getLocalTime(&now, 10)) return "N/A";
+  tm now{};
+  if (!tryGetLocalTimeInfo(now)) return "N/A";
   char buf[32]; strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &now); return String(buf);
 }
 
 bool tryGetLocalTimeInfo(tm& now) {
-  return g_timeSynced && getLocalTime(&now, 10);
+  if (!g_timeSynced) return false;
+  const time_t epoch = time(nullptr);
+  if (epoch < MIN_VALID_EPOCH) return false;
+  return localtime_r(&epoch, &now) != nullptr;
 }
 
 TimeContext buildTimeContext(uint32_t nowMs) {
@@ -216,15 +222,9 @@ void requestTimeSync() {
 
 void updateTimeSyncStatus(uint32_t nowMs) {
   tm now{};
-  if (getLocalTime(&now, 10)) {
+  if (tryGetLocalTimeInfo(now) || getLocalTime(&now, 10)) {
     g_timeSynced = true;
-    if (WiFi.status() == WL_CONNECTED && (!g_timeSyncRequested || (nowMs - g_lastTimeSyncTryMs > 30000))) {
-      requestTimeSync();
-    }
-    return;
   }
-
-  g_timeSynced = false;
   if (WiFi.status() == WL_CONNECTED && (!g_timeSyncRequested || (nowMs - g_lastTimeSyncTryMs > 30000))) {
     requestTimeSync();
   }
@@ -389,19 +389,26 @@ void pushDayRecord(const DayRecord& record) {
   if (g_state.historyCount < HISTORY_DAYS) g_state.historyCount++;
 }
 
-void rolloverDayIfNeeded(uint32_t nowMs) {
-  const TimeContext ctx = buildTimeContext(nowMs);
-  if (ctx.hasRealTime != g_state.dayKeyHasRealTime) {
-    g_state.dayKey = ctx.dayKey;
-    g_state.dayKeyHasRealTime = ctx.hasRealTime;
-    return;
-  }
-  if (ctx.dayKey == g_state.dayKey) return;
-  DayRecord done{}; done.totalTriggers = g_state.totalTriggersToday; done.wakeupMinute = g_state.wakeupMinuteToday;
+void rolloverToDay(const TimeContext& ctx) {
+  DayRecord done{};
+  done.totalTriggers = g_state.totalTriggersToday;
+  done.wakeupMinute = g_state.wakeupMinuteToday;
   pushDayRecord(done);
   g_state.dayKey = ctx.dayKey;
   g_state.dayKeyHasRealTime = ctx.hasRealTime;
   resetDailyFlagsAndCounters();
+}
+
+void rolloverDayIfNeeded(uint32_t nowMs) {
+  const TimeContext ctx = buildTimeContext(nowMs);
+  if (ctx.hasRealTime != g_state.dayKeyHasRealTime) {
+    // Switching between uptime-derived and RTC-derived day keys changes the
+    // meaning of the current bucket; close out the previous day state first.
+    rolloverToDay(ctx);
+    return;
+  }
+  if (ctx.dayKey == g_state.dayKey) return;
+  rolloverToDay(ctx);
 }
 
 uint16_t averageTriggerCount() {
