@@ -28,10 +28,10 @@ const char* AP_SSID = "SeniorAlert-Config";
 const char* AP_PASS = "12345678";
 const char* MQTT_BROKER_ADDR = "bemfa.com";
 constexpr uint16_t MQTT_BROKER_PORT = 9501;
-const char* MQTT_CLIENT_ID = "";
-const char* MQTT_USERNAME = "";
 const char* MQTT_PRIVATE_KEY = "84810b9b5f5245fdbc1e1738837f27a9";
-const char* MQTT_ALERT_TOPIC = "senior/alert/events";
+const char* MQTT_APP_ID = "";
+const char* MQTT_SECRET_KEY = "";
+const char* MQTT_ALERT_TOPIC = "senioralertevents";
 
 constexpr uint32_t MINUTE_MS = 60000UL;
 constexpr uint32_t HOUR_MS = 3600000UL;
@@ -274,35 +274,37 @@ void ensureWifiConnected() {
   }
 }
 
-String mqttClientId() {
-  if (strlen(MQTT_CLIENT_ID) > 0) return String(MQTT_CLIENT_ID);
-  uint64_t chipId = ESP.getEfuseMac();
-  return String("senior-alert-") + String(static_cast<uint32_t>(chipId & 0xFFFFFF), HEX);
-}
-
 void ensureMqttConnected(uint32_t nowMs) {
   if (WiFi.status() != WL_CONNECTED || g_mqtt.connected()) return;
   if (nowMs - g_state.lastMqttRetryMs < 5000) return;
   g_state.lastMqttRetryMs = nowMs;
 
   g_mqtt.setServer(MQTT_BROKER_ADDR, MQTT_BROKER_PORT);
-  const String cid = mqttClientId();
-  bool ok = g_mqtt.connect(cid.c_str(), MQTT_USERNAME, MQTT_PRIVATE_KEY);
-  if (!ok) {
-    Serial.printf("[WARN] MQTT mode-1 failed, state=%d; fallback to mode-2/3/4\n", g_mqtt.state());
+  bool ok = false;
+
+  // Mode-1: private key as clientId, no username/password required.
+  if (strlen(MQTT_PRIVATE_KEY) > 0) {
+    ok = g_mqtt.connect(MQTT_PRIVATE_KEY);
+    if (!ok) {
+      Serial.printf("[WARN] MQTT mode-1 failed, privateKey-as-clientId, state=%d\n", g_mqtt.state());
+    }
   }
 
-  // Fallback mode-2: BEMFA common form (username=private key, empty password)
-  if (!ok) ok = g_mqtt.connect(cid.c_str(), MQTT_PRIVATE_KEY, "");
-  // Fallback mode-3: reverse form (empty username, private key as password)
-  if (!ok) ok = g_mqtt.connect(cid.c_str(), "", MQTT_PRIVATE_KEY);
-  // Fallback mode-4: anonymous
-  if (!ok) ok = g_mqtt.connect(cid.c_str());
+  // Mode-2: fallback to appID/secretKey authentication when provided.
+  if (!ok) {
+    const bool hasAppCreds = strlen(MQTT_APP_ID) > 0 && strlen(MQTT_SECRET_KEY) > 0;
+    if (hasAppCreds) {
+      ok = g_mqtt.connect("senior-alert-app-auth", MQTT_APP_ID, MQTT_SECRET_KEY);
+      if (!ok) {
+        Serial.printf("[WARN] MQTT mode-2 failed, appId/secretKey auth, state=%d\n", g_mqtt.state());
+      }
+    }
+  }
 
   if (ok) {
-    Serial.printf("[INFO] MQTT connected, clientId=%s\n", cid.c_str());
+    Serial.println("[INFO] MQTT connected");
   } else {
-    Serial.printf("[WARN] MQTT connect failed after all modes, final state=%d\n", g_mqtt.state());
+    Serial.printf("[WARN] MQTT connect failed after all configured modes, final state=%d\n", g_mqtt.state());
   }
 }
 
@@ -312,7 +314,11 @@ void publishMqttJson(JsonDocument& doc, const char* label) {
   if (!g_mqtt.connected()) return;
   String payload; serializeJson(doc, payload);
   const bool ok = g_mqtt.publish(MQTT_ALERT_TOPIC, payload.c_str(), true);
-  Serial.printf("[INFO] MQTT %s %s\n", label, ok ? "ok" : "fail");
+  if (ok) {
+    Serial.printf("[INFO] MQTT %s ok topic=%s bytes=%u\n", label, MQTT_ALERT_TOPIC, payload.length());
+  } else {
+    Serial.printf("[WARN] MQTT %s fail topic=%s bytes=%u state=%d\n", label, MQTT_ALERT_TOPIC, payload.length(), g_mqtt.state());
+  }
 }
 
 void publishAlert(const char* title, const char* detail, AlertLevel level) {
