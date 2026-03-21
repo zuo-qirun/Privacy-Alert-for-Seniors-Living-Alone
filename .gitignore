@@ -3,3 +3,8 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+src/secrets.h
+windows_client/config.json
+.pytest_cache/
+__pycache__/
+windows_client/__pycache__/

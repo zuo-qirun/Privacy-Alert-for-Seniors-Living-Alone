@@ -8,6 +8,7 @@
 - 订阅当前设备主题 `senioralertevents`
 - 实时展示：
   - 风险等级
+  - 原因码（`reason_code`）
   - 设备状态
   - 卧室 PIR / 厕所 PIR / 门磁 / 床压
   - Wi-Fi / AP 模式
@@ -21,6 +22,15 @@ cd windows_client
 python -m pip install -r requirements.txt
 ```
 
+## 配置
+
+默认不再把私钥硬编码在 `app.py` 中。
+
+首次使用时：
+1. 复制 `config.example.json` 为 `config.json`
+2. 在 `config.json` 中填写 `private_key`，或填写 `app_id` 和 `secret_key`
+3. 运行客户端，必要时在界面中继续调整 Broker / Port / Topic
+
 ## 运行
 
 ```bash
@@ -30,7 +40,7 @@ python app.py
 
 ## 连接方式
 
-默认配置已经填好：
+默认配置：
 
 - Broker: `bemfa.com`
 - Port: `9501`
@@ -38,10 +48,16 @@ python app.py
 
 认证优先级：
 
-1. 如果填写了 `Private Key`，客户端会使用“私钥作为 clientId”连接
-2. 如果没有私钥，但填写了 `App ID` 和 `Secret Key`，则使用账号密码认证
+1. 如果填写了 `private_key`，客户端会使用“私钥作为 clientId”连接
+2. 如果没有私钥，但填写了 `app_id` 和 `secret_key`，则使用账号密码认证
 
-## 备注
+## 协议
 
-- 客户端目前是 Python + Tkinter 实现，不需要额外 UI 框架。
-- 如果你后面要打包成 `.exe`，可以再用 `pyinstaller` 处理。
+客户端优先读取共享协议字段：
+
+- `risk_level`
+- `reason_code`
+- `risk_level_cn`
+- `status_cn`
+
+共享契约见根目录的 `shared_protocol/` 和 `docs/protocol.md`。

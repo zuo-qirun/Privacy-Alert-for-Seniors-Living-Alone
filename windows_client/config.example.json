@@ -1,0 +1,8 @@
+{
+  "broker": "bemfa.com",
+  "port": 9501,
+  "topic": "senioralertevents",
+  "private_key": "",
+  "app_id": "",
+  "secret_key": ""
+}

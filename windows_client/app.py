@@ -3,6 +3,8 @@ import queue
 import threading
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+import sys
 from typing import Any
 
 import tkinter as tk
@@ -10,13 +12,28 @@ from tkinter import messagebox, ttk
 
 import paho.mqtt.client as mqtt
 
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from shared_protocol.protocol import FIELD_REASON_CODE, FIELD_RISK_LEVEL
 
 DEFAULT_BROKER = "bemfa.com"
 DEFAULT_PORT = 9501
 DEFAULT_TOPIC = "senioralertevents"
-DEFAULT_PRIVATE_KEY = "84810b9b5f5245fdbc1e1738837f27a9"
+DEFAULT_PRIVATE_KEY = ""
 MAX_LOG_LINES = 1000
 LOG_TRIM_TARGET_LINES = 800
+CONFIG_PATH = Path(__file__).with_name("config.json")
+
+
+def load_saved_config() -> dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 @dataclass
@@ -36,6 +53,8 @@ class SeniorAlertClient:
         self.root.geometry("1120x760")
         self.root.minsize(1000, 700)
 
+        saved = load_saved_config()
+
         self.event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.mqtt_client: mqtt.Client | None = None
         self.worker_lock = threading.Lock()
@@ -46,6 +65,7 @@ class SeniorAlertClient:
         self.last_message_type = tk.StringVar(value="-")
         self.risk_text = tk.StringVar(value="normal")
         self.risk_cn_text = tk.StringVar(value="正常")
+        self.reason_text = tk.StringVar(value="-")
         self.status_text = tk.StringVar(value="-")
         self.device_time_text = tk.StringVar(value="-")
         self.topic_text = tk.StringVar(value=DEFAULT_TOPIC)
@@ -64,12 +84,12 @@ class SeniorAlertClient:
         self.alert_title_var = tk.StringVar(value="-")
         self.alert_detail_var = tk.StringVar(value="-")
 
-        self.broker_var = tk.StringVar(value=DEFAULT_BROKER)
-        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
-        self.topic_var = tk.StringVar(value=DEFAULT_TOPIC)
-        self.private_key_var = tk.StringVar(value=DEFAULT_PRIVATE_KEY)
-        self.app_id_var = tk.StringVar(value="")
-        self.secret_key_var = tk.StringVar(value="")
+        self.broker_var = tk.StringVar(value=str(saved.get("broker", DEFAULT_BROKER)))
+        self.port_var = tk.StringVar(value=str(saved.get("port", DEFAULT_PORT)))
+        self.topic_var = tk.StringVar(value=str(saved.get("topic", DEFAULT_TOPIC)))
+        self.private_key_var = tk.StringVar(value=str(saved.get("private_key", DEFAULT_PRIVATE_KEY)))
+        self.app_id_var = tk.StringVar(value=str(saved.get("app_id", "")))
+        self.secret_key_var = tk.StringVar(value=str(saved.get("secret_key", "")))
 
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -139,6 +159,7 @@ class SeniorAlertClient:
             ("最近消息类型", self.last_message_type),
             ("风险代码", self.risk_text),
             ("风险等级", self.risk_cn_text),
+            ("原因码", self.reason_text),
             ("状态", self.status_text),
             ("设备时间", self.device_time_text),
         ]
@@ -191,6 +212,7 @@ class SeniorAlertClient:
                 return
 
             self.topic_text.set(config.topic)
+            self._save_config(config)
             try:
                 if config.private_key:
                     client_id = config.private_key
@@ -265,6 +287,17 @@ class SeniorAlertClient:
             secret_key=secret_key,
         )
 
+    def _save_config(self, config: MqttConfig) -> None:
+        payload = {
+            "broker": config.broker,
+            "port": config.port,
+            "topic": config.topic,
+            "private_key": config.private_key,
+            "app_id": config.app_id,
+            "secret_key": config.secret_key,
+        }
+        CONFIG_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
     def on_connect(self, client: mqtt.Client, _userdata: Any, flags: Any, reason_code: Any, _properties: Any) -> None:
         code_value = getattr(reason_code, "value", reason_code)
         if code_value == 0:
@@ -315,8 +348,9 @@ class SeniorAlertClient:
         self.last_message_type.set(str(data.get("type", "-")))
         self.topic_text.set(topic)
 
-        self.risk_text.set(str(data.get("risk", self.risk_text.get())))
-        self.risk_cn_text.set(str(data.get("risk_cn", self.risk_cn_text.get())))
+        self.risk_text.set(str(data.get(FIELD_RISK_LEVEL, data.get("risk", self.risk_text.get()))))
+        self.risk_cn_text.set(str(data.get("risk_level_cn", data.get("risk_cn", self.risk_cn_text.get()))))
+        self.reason_text.set(str(data.get(FIELD_REASON_CODE, self.reason_text.get())))
         self.status_text.set(str(data.get("status_cn", self.status_text.get())))
         self.device_time_text.set(str(data.get("time", data.get("now_time", self.device_time_text.get()))))
 
@@ -350,10 +384,9 @@ class SeniorAlertClient:
         stamp = datetime.now().strftime("%H:%M:%S")
         message = message.rstrip("\n")
         line = f"[{stamp}] {message}\n"
-        added_lines = line.count("\n")
         self.log_box.configure(state=tk.NORMAL)
         self.log_box.insert(tk.END, line)
-        self.log_line_count += added_lines
+        self.log_line_count += line.count("\n")
         self._trim_log_if_needed()
         self.log_box.see(tk.END)
         self.log_box.configure(state=tk.DISABLED)
